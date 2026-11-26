@@ -1,0 +1,142 @@
+name: U-3 in-place failure baseline comparison
+
+on:
+  push:
+    branches: [codex/u3-inplace-validation-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: u3-inplace-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  U3_BASELINE_SHA: e8aa6152a4911e6e16e4077e29b9925d93da7b26
+  U3_PATCHED_SHA: 3d18f44a6f395248038986b0359f8078f8fa14b2
+  INPLACE_TEST: inplace::tests::warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset
+  INPLACE_PROBE: inplace::tests::warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes
+  C2_TEST: indirect::tests::warp_budget_saturates_without_wraparound_and_preserves_draw_fields
+
+jobs:
+  compare:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: 'false'
+      - name: Build exact baseline and patched GPU debug test executables
+        shell: pwsh
+        run: |
+          Get-ChildItem Env:LEONIDA_* | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
+          git diff --exit-code $env:U3_BASELINE_SHA $env:U3_PATCHED_SHA -- crates/leonida-gpu/src/inplace.rs crates/leonida-gpu/src/indirect.rs
+          if ($LASTEXITCODE -ne 0) { throw 'The compared in-place/C2 source files differ; investigate before classifying results.' }
+          $builds = @()
+          foreach ($entry in @(@('baseline', $env:U3_BASELINE_SHA), @('patched', $env:U3_PATCHED_SHA))) {
+            $label, $sha = $entry
+            $directory = Join-Path $env:RUNNER_TEMP "leonida-u3-inplace-$label"
+            $target = Join-Path $env:RUNNER_TEMP "leonida-u3-inplace-target-$label"
+            git worktree add --detach $directory $sha
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Push-Location $directory
+            try {
+              $env:CARGO_TARGET_DIR = $target
+              git rev-parse HEAD
+              $messages = cargo test -p leonida-gpu --lib --locked --no-run --message-format=json
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              $executables = @($messages | ForEach-Object { $_ | ConvertFrom-Json } |
+                Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'leonida_gpu' -and $_.executable } |
+                ForEach-Object { $_.executable })
+              if ($executables.Count -ne 1) { throw "Expected exactly one $label GPU test executable." }
+              $exe = $executables[0]
+              $tests = & $exe --list
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              foreach ($name in @($env:INPLACE_TEST, $env:INPLACE_PROBE, $env:C2_TEST)) {
+                if ($tests -notcontains ($name + ': test')) { throw "Missing $label test: $name" }
+              }
+              $builds += [ordered]@{ label=$label; sha=$sha; executable=$exe; directory=$directory }
+            } finally { Pop-Location }
+          }
+          $manifest = Join-Path $env:RUNNER_TEMP 'u3-inplace-builds.json'
+          $builds | ConvertTo-Json -Depth 4 | Set-Content $manifest
+          "U3_COMPARE_MANIFEST=$manifest" >> $env:GITHUB_ENV
+          Get-Content $manifest
+      - name: Compare isolated, in-place group, and full GPU suites without retrying away failures
+        shell: pwsh
+        run: |
+          Get-ChildItem Env:LEONIDA_* | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
+          $builds = @(Get-Content -Raw $env:U3_COMPARE_MANIFEST | ConvertFrom-Json)
+          $results = [Collections.Generic.List[object]]::new()
+          function Invoke-Comparison($build, [string]$phase, [int]$round, [string[]]$testArgs) {
+            $stem = "u3-inplace-$($build.label)-$phase-$round"
+            $stdout = Join-Path $env:RUNNER_TEMP ($stem + '.stdout.log')
+            $stderr = Join-Path $env:RUNNER_TEMP ($stem + '.stderr.log')
+            Write-Output "U3_COMPARE_START label=$($build.label) sha=$($build.sha) phase=$phase round=$round"
+            $process = Start-Process -FilePath $build.executable -ArgumentList $testArgs -WorkingDirectory $build.directory -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            [void]$process.Handle
+            if (-not $process.WaitForExit(120000)) {
+              $process.Kill($true)
+              $process.WaitForExit()
+              Get-Content $stdout, $stderr | Write-Output
+              throw "Timed out: $stem"
+            }
+            $process.Refresh()
+            $code = $process.ExitCode
+            $text = (Get-Content -Raw $stdout) + "`n" + (Get-Content -Raw $stderr)
+            Write-Output $text
+            $summary = [regex]::Match($text, 'test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;')
+            if (-not $summary.Success -or $code -notin @(0, 101)) { throw "Unexpected process result: $stem, exit $code" }
+            $failedNames = @([regex]::Matches($text, '(?m)^test (\S+) \.\.\. FAILED\s*$') | ForEach-Object { $_.Groups[1].Value })
+            $inplaceDecommit = $failedNames -contains $env:INPLACE_TEST -and
+              $text -match 'inplace\.rs:1387:13' -and $text -match 'assertion `left != right` failed' -and
+              $text -match 'left: 0' -and $text -match 'right: 0'
+            $c2Old = $failedNames -contains $env:C2_TEST -and $text -match 'the first two real draws fit the budget'
+            $unexpected = @($failedNames | Where-Object {
+              -not ($_ -eq $env:INPLACE_TEST -and $inplaceDecommit) -and -not ($_ -eq $env:C2_TEST -and $c2Old)
+            })
+            if ($failedNames.Count -ne [int]$summary.Groups[2].Value) { $unexpected += 'unclassified harness failure' }
+            $row = [ordered]@{ label=$build.label; sha=$build.sha; phase=$phase; round=$round; exit=$code;
+              passed=[int]$summary.Groups[1].Value; failed=[int]$summary.Groups[2].Value; ignored=[int]$summary.Groups[3].Value;
+              inplace_decommit=$inplaceDecommit; c2_old_assertion=$c2Old; unexpected=$unexpected; failed_names=$failedNames }
+            $results.Add($row)
+            Write-Output ('U3_COMPARE_RESULT=' + ($row | ConvertTo-Json -Compress -Depth 4))
+            if ($phase -eq 'capability') {
+              if ($code -ne 0 -or $text -notmatch 'in place probe: VERDICT: private memory in place: reads true, writes true') {
+                throw "WARP / ID3D12Device13 execution was not demonstrated for $($build.label)."
+              }
+            }
+          }
+          foreach ($build in $builds) {
+            Invoke-Comparison $build 'capability' 1 @($env:INPLACE_PROBE, '--exact', '--nocapture', '--test-threads=1')
+          }
+          $phases = @(
+            @{ name='isolated'; rounds=16; arguments=@($env:INPLACE_TEST, '--exact', '--nocapture', '--test-threads=1') },
+            @{ name='inplace-parallel'; rounds=8; arguments=@('inplace::tests::', '--nocapture') },
+            @{ name='gpu-parallel'; rounds=16; arguments=@('--nocapture') },
+            @{ name='gpu-serial'; rounds=2; arguments=@('--nocapture', '--test-threads=1') }
+          )
+          foreach ($phase in $phases) {
+            for ($round = 1; $round -le $phase.rounds; $round++) {
+              # Alternate AB then BA on one runner to avoid a fixed warm-up/order advantage.
+              $order = if ($round % 2) { $builds } else { @($builds[1], $builds[0]) }
+              foreach ($build in $order) { Invoke-Comparison $build $phase.name $round $phase.arguments }
+            }
+          }
+          $path = Join-Path $env:RUNNER_TEMP 'u3-inplace-results.json'
+          $results | ConvertTo-Json -Depth 6 | Set-Content $path
+          foreach ($group in ($results | Group-Object label, phase)) {
+            $inplace = @($group.Group | Where-Object { $_.inplace_decommit }).Count
+            $c2 = @($group.Group | Where-Object { $_.c2_old_assertion }).Count
+            $unexpected = @($group.Group | Where-Object { $_.unexpected.Count -ne 0 }).Count
+            Write-Output "U3_COMPARE_SUMMARY $($group.Name): runs=$($group.Count), inplace_decommit=$inplace, c2_old_assertion=$c2, unexpected=$unexpected"
+          }
+          Write-Output 'Zero observed failures do not prove the test is deterministic. Legacy isolated test passes may skip; the separate capability probe confirms this runner supports the required API.'
+          # Preserve the failure status; the full log and summaries establish the comparison.
+          if (@($results | Where-Object { $_.exit -ne 0 }).Count -ne 0) { exit 1 }
