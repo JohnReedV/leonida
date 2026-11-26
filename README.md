@@ -140,6 +140,42 @@ Input: XInput pads. With none connected, the keyboard acts as a pad while the ga
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+### Testing the optional one-record clamp
+
+An experimental optimization reduces GPU work before individual indirect draws. It improved a synthetic
+RTX 5090 benchmark by 19.4%; gameplay and other cards are unmeasured, so it stays off by default.
+[The measurements and limits are here](docs/fork-notes.md#newest-2026-11-26).
+
+To compare it using your configured game, create `gpu-profiles.local.json` with the following content. If
+the file already exists, add only this profile object to its existing `profiles` array:
+
+```json
+{
+  "profiles": [
+    {
+      "name": "single-clamp-test",
+      "opt_in": true,
+      "match": {},
+      "env": { "LEONIDA_INDIRECT_SINGLE": "1" }
+    }
+  ]
+}
+```
+
+Run this pair in PowerShell from the checkout. Both use the base settings; the second adds the new clamp:
+
+```powershell
+cargo build --profile diag -p leonida --features diagnostics
+$clampSeries = Join-Path $env:LOCALAPPDATA 'leonida\runs\single-clamp'
+powershell -ExecutionPolicy Bypass -File scripts\measure-run.ps1 `
+  -Root $clampSeries -Label 01-base -Profile base
+powershell -ExecutionPolicy Bypass -File scripts\measure-run.ps1 `
+  -Root $clampSeries -Label 02-single -Profile single-clamp-test
+```
+
+Repeat the pair with new labels before judging frame times. Compare the pictures locally and share only
+the figures from `summary.txt`. Ordinary launches keep this profile off.
+
 ## Updating
 
 Get the newest version before you report a problem: it may already be fixed. In PowerShell, in the folder you

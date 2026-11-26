@@ -69,12 +69,18 @@ static const uint GROUPS = 1u << 20;
 // round for each record of a window, and in memory the CPU maps (where the
 // budget was, and is with LEONIDA_INDIRECT_CARD_BUDGET=0) every atomic
 // crosses the bus on a card of its own.
+#ifndef SINGLE_RECORD
 groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+#endif
 [RootSignature(RS)]
+#ifdef SINGLE_RECORD
+[numthreads(1, 1, 1)]
+#else
 [numthreads(64, 1, 1)]
+#endif
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
@@ -96,10 +102,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
+#ifndef SINGLE_RECORD
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
     }
+#endif
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 want = src_args.Load2(src_at);
@@ -147,6 +155,31 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
+#ifdef SINGLE_RECORD
+    // Selected only for one record: no other lanes need its cost or fit.
+    if (!active) {
+        return;
+    }
+    uint before;
+    budget.InterlockedOr(0, 0, before);
+    bool over = false;
+    if (cost > 0) {
+        [allow_uav_condition]
+        while (before < BUDGET) {
+            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+            uint prev;
+            budget.InterlockedCompareExchange(0, before, next, prev);
+            if (prev == before) break;
+            before = prev;
+        }
+        over = before >= BUDGET || BUDGET - before < cost;
+    }
+    if (kind > 2) {
+        uint was;
+        budget.InterlockedMax(4, asked, was);
+        budget.InterlockedAdd(8, min(asked, 1u << 24), was);
+    }
+#else
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
     if (active && kind > 2) {
@@ -204,6 +237,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         return;
     }
     bool over = fits[gi] == 0;
+#endif
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -227,6 +261,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    single: Option<ID3D12PipelineState>,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -253,12 +288,46 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    make_from(device, SOURCE)
+    let mut clamp = make_from(device, SOURCE)?;
+    // Opt-in until measured in game and on more cards. The general shader stays available
+    // if a driver cannot compile this specialization; resource barriers are identical.
+    if std::env::var_os("LEONIDA_INDIRECT_SINGLE").is_some_and(|v| v == "1") {
+        match single_pso_for(device, &clamp.root) {
+            Ok(pso) => clamp.single = Some(pso),
+            Err(e) => tracing::warn!(error = %e,
+                "no single-record argument clamp: keeping the general clamp"),
+        }
+    }
+    Ok(clamp)
+}
+
+fn single_pso_for(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+) -> windows::core::Result<ID3D12PipelineState> {
+    let source = format!("#define SINGLE_RECORD\n{SOURCE}");
+    Ok(make_from_with_root(device, &source, Some(root))?.pso)
+}
+
+/// Tests and benchmarks explicitly request the specialization and fail on compilation errors.
+#[cfg(test)]
+fn make_single_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    let mut clamp = make_from(device, SOURCE)?;
+    clamp.single = Some(single_pso_for(device, &clamp.root)?);
+    Ok(clamp)
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    make_from_with_root(device, source, None)
+}
+
+fn make_from_with_root(
+    device: &ID3D12Device,
+    source: &str,
+    root: Option<&ID3D12RootSignature>,
+) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -295,7 +364,10 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let root = match root {
+            Some(root) => root.clone(),
+            None => device.CreateRootSignature(0, bytes)?,
+        };
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -304,7 +376,11 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
             },
             ..Default::default()
         })?;
-        Ok(Clamp { root, pso })
+        Ok(Clamp {
+            root,
+            pso,
+            single: None,
+        })
     }
 }
 
@@ -488,7 +564,12 @@ fn record_clamp_as(
         l.ResourceBarrier(&first[skip..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
+            let pso = if records == 1 {
+                c.single.as_ref().unwrap_or(&c.pso)
+            } else {
+                &c.pso
+            };
+            l.SetPipelineState(pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
@@ -964,6 +1045,13 @@ void main() {
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 let device = device?;
+                Self::on_device(device)
+            }
+        }
+
+        fn on_device(device: ID3D12Device) -> Option<Self> {
+            // SAFETY: plain D3D12 object creation on the supplied live device.
+            unsafe {
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -1144,7 +1232,11 @@ void main() {
                 },
                 ..Default::default()
             })?;
-            Ok(Clamp { root, pso })
+            Ok(Clamp {
+                root,
+                pso,
+                single: None,
+            })
         }
     }
 
@@ -1316,6 +1408,241 @@ void main() {
         piece0[5] ^= 1;
         piece0[9] ^= 2;
         assert_eq!(slot(PIECE - SKEW as usize), piece0);
+    }
+
+    fn single_records_match_grouped(warp: &mut WarpHarness) {
+        #[derive(Debug)]
+        struct Case {
+            kind: u32,
+            stride: u32,
+            words: [u32; 3],
+            count: Option<u32>,
+            ahead: bool,
+            spent: u32,
+        }
+        const CAP: u32 = 1 << 27;
+        let draws = [
+            [0, u32::MAX, 17],
+            [3, 2, 17],
+            [4, 32, 17],
+            [(1 << 23) - 1, u32::MAX, 17],
+            [1 << 23, 1, 17],
+            [(1 << 24) + 1, 2, 17],
+            [1, (1 << 24) + 1, 17],
+        ];
+        let dispatches = [
+            [0, u32::MAX, u32::MAX],
+            [3, 2, 1],
+            [2, 1, 1],
+            [65535, 16, 1],
+            [65535, 17, 1],
+            [u32::MAX, u32::MAX, 0],
+            [u32::MAX, u32::MAX, u32::MAX],
+        ];
+        let meshes = [
+            [0, 1, 1],
+            [5, 1, 1],
+            [1, 1, 1],
+            [65535, 1, 1],
+            [65536, 2, 2],
+            [u32::MAX, u32::MAX, u32::MAX],
+            [5, 0, 1],
+            [5, 1, 0],
+        ];
+        let mut cases = Vec::new();
+        for kind in [0, 1, 2, 10] {
+            let inputs: &[[u32; 3]] = match kind {
+                0 | 1 => &draws,
+                2 => &dispatches,
+                _ => &meshes,
+            };
+            for (i, &words) in inputs.iter().enumerate() {
+                for count in [None, Some(0), Some(1), Some(u32::MAX)] {
+                    for ahead in [false, true] {
+                        for spent in [0, CAP - 6, CAP - 128, CAP - 1, CAP, CAP + 1, u32::MAX] {
+                            cases.push(Case {
+                                kind,
+                                stride: if i % 2 == 0 {
+                                    min_stride(kind).unwrap()
+                                } else {
+                                    32
+                                },
+                                words,
+                                count,
+                                ahead,
+                                spent,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let grouped = make_from(&warp.device, SOURCE).expect("the grouped clamp must compile");
+        let single = make_single_for(&warp.device).expect("the single-record clamp must compile");
+        assert!(
+            single.single.is_some(),
+            "parity must exercise the specialized pipeline"
+        );
+        let bytes = cases.len() * 64;
+        let (src, src_ptr, _) = warp.shared_buffer(bytes as u64);
+        let (counts, count_ptr, _) = warp.shared_buffer((cases.len() * 16) as u64);
+        let (_budgets, budget_ptr, budget_gpu) = warp.shared_buffer((cases.len() * 32) as u64);
+        let (out, out_ptr, _) = warp.shared_buffer((bytes * 2) as u64);
+        let (seed, seed_ptr, _) = warp.shared_buffer(64);
+        let scratch = warp.default_uav(64);
+        let mut source = vec![0x5au8; bytes];
+        let mut count_source = vec![0x3cu8; cases.len() * 16];
+        for (i, case) in cases.iter().enumerate() {
+            let at = i * 64 + 4;
+            let words = [
+                case.words[0],
+                case.words[1],
+                case.words[2],
+                (-19i32) as u32,
+                103,
+                0xcafe_0123,
+                0x7654_3210,
+                0xfedc_ba98,
+            ];
+            for (j, word) in words.into_iter().enumerate() {
+                source[at + j * 4..at + (j + 1) * 4].copy_from_slice(&word.to_le_bytes());
+            }
+            count_source[i * 16 + 4..i * 16 + 8]
+                .copy_from_slice(&case.count.unwrap_or(0).to_le_bytes());
+        }
+        // SAFETY: each mapped allocation is at least the size written; no GPU work is in flight.
+        unsafe {
+            std::ptr::copy_nonoverlapping(source.as_ptr(), src_ptr, source.len());
+            std::ptr::copy_nonoverlapping(count_source.as_ptr(), count_ptr, count_source.len());
+            std::ptr::write_bytes(seed_ptr, 0xa5, 64);
+            std::ptr::write_bytes(out_ptr, 0xee, bytes * 2);
+            for variant in 0..2 {
+                for (i, case) in cases.iter().enumerate() {
+                    let at = budget_ptr
+                        .cast::<u32>()
+                        .add((variant * cases.len() + i) * 4);
+                    at.write(case.spent);
+                    at.add(1).write(17);
+                    at.add(2).write(u32::MAX - 7);
+                    at.add(3).write(0x3ca5_5ac3);
+                }
+            }
+        }
+        for (variant, clamp) in [&grouped, &single].into_iter().enumerate() {
+            for (i, case) in cases.iter().enumerate() {
+                // SAFETY: one open list, live buffers, and every transition matches the prior use.
+                unsafe {
+                    warp.list.ResourceBarrier(&[transition(
+                        &scratch,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    warp.list.CopyBufferRegion(&scratch, 0, &seed, 0, 64);
+                    warp.list.ResourceBarrier(&[transition(
+                        &scratch,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+                assert!(record_clamp_as(
+                    clamp,
+                    &warp.list,
+                    (&scratch, D3D12_RESOURCE_STATE_COMMON),
+                    budget_gpu + ((variant * cases.len() + i) * 16) as u64,
+                    (&src, (i * 64 + 4) as u64),
+                    case.count.map(|_| (&counts, (i * 16 + 4) as u64)),
+                    (case.kind, case.stride, 1),
+                    case.ahead,
+                ));
+                // SAFETY: the clamp left scratch readable as arguments; copy it before reuse.
+                unsafe {
+                    warp.list.ResourceBarrier(&[transition(
+                        &scratch,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    warp.list.CopyBufferRegion(
+                        &out,
+                        ((variant * cases.len() + i) * 64) as u64,
+                        &scratch,
+                        0,
+                        64,
+                    );
+                    warp.list.ResourceBarrier(&[transition(
+                        &scratch,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+            }
+        }
+        warp.submit_and_wait();
+        // SAFETY: the submission finished; all inspected bytes belong to the mapped allocations.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(src_ptr, source.len()), source);
+            assert_eq!(
+                std::slice::from_raw_parts(count_ptr, count_source.len()),
+                count_source
+            );
+            let result = std::slice::from_raw_parts(out_ptr, bytes * 2);
+            let budgets = std::slice::from_raw_parts(budget_ptr.cast::<u32>(), cases.len() * 8);
+            for (i, case) in cases.iter().enumerate() {
+                let general = &result[i * 64..(i + 1) * 64];
+                let specialized = &result[bytes + i * 64..bytes + (i + 1) * 64];
+                assert_eq!(specialized, general, "arguments: {case:?}");
+                let general_budget = &budgets[i * 4..(i + 1) * 4];
+                let at = (cases.len() + i) * 4;
+                let single_budget = &budgets[at..at + 4];
+                assert_eq!(
+                    single_budget, general_budget,
+                    "budget and diagnostics: {case:?}"
+                );
+                assert_eq!(single_budget[3], 0x3ca5_5ac3, "budget guard: {case:?}");
+                assert!(
+                    specialized[case.stride as usize..]
+                        .iter()
+                        .all(|&b| b == 0xa5)
+                );
+                if case.count == Some(0) {
+                    assert_eq!(single_budget, [case.spent, 17, u32::MAX - 7, 0x3ca5_5ac3]);
+                    assert!(specialized.iter().all(|&b| b == 0xa5), "inactive: {case:?}");
+                }
+            }
+        }
+        eprintln!(
+            "single-record clamp parity: {} cases, both pipelines executed",
+            cases.len()
+        );
+    }
+
+    #[test]
+    fn warp_single_records_match_grouped_arguments_and_budget() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        single_records_match_grouped(&mut warp);
+    }
+
+    #[test]
+    #[ignore = "requires a hardware GPU; no game files needed"]
+    fn host_single_records_match_grouped_arguments_and_budget() {
+        let host = super::host().expect("a hardware GPU is required for this explicit test");
+        // SAFETY: querying the adapter associated with a live D3D12 device.
+        let desc = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .unwrap()
+                .EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
+                .unwrap()
+                .GetDesc1()
+                .unwrap()
+        };
+        assert_eq!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+        eprintln!(
+            "single-record clamp parity on {}",
+            String::from_utf16_lossy(&desc.Description).trim_end_matches('\0')
+        );
+        let mut gpu = WarpHarness::on_device(host.device.clone()).expect("hardware test harness");
+        single_records_match_grouped(&mut gpu);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

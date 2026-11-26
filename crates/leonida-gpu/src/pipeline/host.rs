@@ -1081,6 +1081,23 @@ mod tests {
             eprintln!("no PC dxc.exe; skipped");
             return;
         };
+        // Microsoft's Basic Render Driver reports depth-bounds support but ignores the bounds
+        // with ordinary depth testing off. Keep that stronger case on hardware. On the software
+        // driver, ALWAYS with no depth writes still leaves bounds as the only draw filter.
+        let basic_render_driver = {
+            use windows::Win32::Graphics::Dxgi::{
+                CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+            };
+            // SAFETY: the host device's LUID identifies its live DXGI adapter.
+            unsafe {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+                let adapter: IDXGIAdapter1 =
+                    factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).unwrap();
+                let desc = adapter.GetDesc1().unwrap();
+                desc.VendorId == 0x1414 && desc.DeviceId == 0x008c
+            }
+        };
         let dir = tempfile::tempdir().unwrap();
         let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
@@ -1088,13 +1105,14 @@ mod tests {
 
         let mut g = GraphicsState::default();
         // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
-        // depth test itself off so only depth bounds gates the draw.
+        // depth test itself off on hardware. On Basic Render Driver, ALWAYS and no depth writes
+        // make bounds the sole gate while forcing this driver to read the stored depth.
         #[repr(C, align(8))]
         struct Sub21(u32, D3D12_DEPTH_STENCIL_DESC1);
         let sub = Sub21(
             21,
             D3D12_DEPTH_STENCIL_DESC1 {
-                DepthEnable: false.into(),
+                DepthEnable: basic_render_driver.into(),
                 DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
                 DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
                 DepthBoundsTestEnable: true.into(),
