@@ -1,0 +1,204 @@
+name: C-2 indirect budget native Windows validation
+
+on:
+  push:
+    branches: [codex/c2-indirect-budget-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c2-indirect-budget-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Instrumented regression probes retain the old assertion and unchanged production code.
+  C2_BASELINE_SHA: 57134f738407a1527aa27129d63c3dcc70e2fede
+  C2_EXECUTED_MARKER: "indirect budget: order="
+  C2_UNORDERED_MARKER: "indirect budget saturation: 16 unordered cases executed"
+  C2_ORDERED_MARKER: "indirect budget saturation: 2 ordered cases executed"
+  C2_REVERSE_TEST: indirect::tests::warp_budget_saturates_in_both_group_submission_orders
+  C2_ORIGINAL_TEST: indirect::tests::warp_budget_saturates_without_wraparound_and_preserves_draw_fields
+  C2_OLD_ASSERTION: the first two real draws fit the budget
+
+jobs:
+  check:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --locked
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Includes xtask's repository_passes_policy, the asset-policy check.
+      - name: Workspace tests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --locked --no-fail-fast
+
+  gpu:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/leonida-c2-patched-target
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: 'false'
+      - name: Verify patched release tests and execution contracts
+        shell: pwsh
+        run: |
+          git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($value in @($env:C2_EXECUTED_MARKER, $env:C2_UNORDERED_MARKER, $env:C2_ORDERED_MARKER, $env:C2_REVERSE_TEST)) {
+            if ($value.StartsWith('TODO_')) { throw 'Finalize the C-2 test and execution-marker contracts.' }
+          }
+          $tests = cargo test -p leonida-gpu --lib --release --locked indirect:: -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests | Write-Output
+          foreach ($name in @($env:C2_ORIGINAL_TEST, $env:C2_REVERSE_TEST)) {
+            if ($tests -notcontains ($name + ': test')) { throw "Missing patched test: $name" }
+          }
+      - name: Patched release indirect suite must execute GPU cases
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'c2-patched-indirect.log'
+          cargo test -p leonida-gpu --lib --release --locked indirect:: -- --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { exit $testExit }
+          $text = Get-Content -Raw $log
+          foreach ($marker in @($env:C2_UNORDERED_MARKER, $env:C2_ORDERED_MARKER)) {
+            if ($text -notmatch [regex]::Escape($marker)) {
+              throw "GPU cases did not execute completely: missing $marker"
+            }
+          }
+      - name: Repeat corrected original test 32 times
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          for ($round = 1; $round -le 32; $round++) {
+            $log = Join-Path $env:RUNNER_TEMP "c2-patched-original-$round.log"
+            Write-Output "C2_PATCHED_ROUND=$round"
+            cargo test -p leonida-gpu --lib --release --locked $env:C2_ORIGINAL_TEST -- --exact --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+            $testExit = $LASTEXITCODE
+            if ($testExit -ne 0) { exit $testExit }
+            $text = Get-Content -Raw $log
+            if ($text -notmatch [regex]::Escape($env:C2_UNORDERED_MARKER) -or
+                $text -notmatch [regex]::Escape('test result: ok. 1 passed; 0 failed; 0 ignored;')) {
+              throw "Round $round did not execute exactly one passing GPU test."
+            }
+          }
+          Write-Output 'C2_PATCHED_REPETITIONS=32/32 executed and passed; 16 unordered cases per repetition'
+      - name: Require both exact ordered cases after repetitions
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'c2-patched-ordered.log'
+          cargo test -p leonida-gpu --lib --release --locked $env:C2_REVERSE_TEST -- --exact --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { exit $testExit }
+          $text = Get-Content -Raw $log
+          if ($text -notmatch [regex]::Escape($env:C2_ORDERED_MARKER) -or
+              $text -notmatch [regex]::Escape('test result: ok. 1 passed; 0 failed; 0 ignored;')) {
+            throw 'The exact ordered test did not execute and pass both cases.'
+          }
+
+  baseline_probe:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/leonida-c2-baseline-target
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: 'false'
+      - name: Prepare instrumented old-assertion baseline outside checkout
+        shell: pwsh
+        run: |
+          if ($env:C2_BASELINE_SHA -notmatch '^[0-9a-f]{40}$') {
+            throw 'Pin the full instrumented old-assertion baseline commit before publishing.'
+          }
+          $baseline = Join-Path $env:RUNNER_TEMP 'leonida-c2-baseline'
+          git worktree add --detach $baseline $env:C2_BASELINE_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "C2_BASELINE_DIR=$baseline" >> $env:GITHUB_ENV
+      - name: Build and verify baseline probe tests
+        working-directory: ${{ env.C2_BASELINE_DIR }}
+        shell: pwsh
+        run: |
+          git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests = cargo test -p leonida-gpu --lib --release --locked indirect:: -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests | Write-Output
+          foreach ($name in @($env:C2_ORIGINAL_TEST, $env:C2_REVERSE_TEST)) {
+            if ($tests -notcontains ($name + ': test')) { throw "Missing baseline probe: $name" }
+          }
+      - name: Observe natural baseline scheduling without requiring a race
+        working-directory: ${{ env.C2_BASELINE_DIR }}
+        shell: pwsh
+        run: |
+          $observed = 0
+          for ($round = 1; $round -le 32; $round++) {
+            $log = Join-Path $env:RUNNER_TEMP "c2-baseline-natural-$round.log"
+            Write-Output "C2_BASELINE_NATURAL_ROUND=$round"
+            cargo test -p leonida-gpu --lib --release --locked $env:C2_ORIGINAL_TEST -- --exact --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+            $testExit = $LASTEXITCODE
+            $text = Get-Content -Raw $log
+            if ($text -notmatch [regex]::Escape($env:C2_EXECUTED_MARKER)) {
+              throw "Baseline round $round did not execute the GPU workload."
+            }
+            if ($testExit -eq 0) {
+              if ($text -notmatch [regex]::Escape($env:C2_UNORDERED_MARKER) -or
+                  $text -notmatch [regex]::Escape('test result: ok. 1 passed; 0 failed; 0 ignored;')) {
+                throw "Baseline round $round did not report 16 executed cases in exactly one passing test."
+              }
+            } elseif ($testExit -eq 101 -and
+                      $text -match [regex]::Escape($env:C2_OLD_ASSERTION) -and
+                      $text -match 'indirect budget: order=None, survivors=\[\s*64\s*,\s*65\s*\], spent=134217728' -and
+                      $text -match [regex]::Escape('test result: FAILED. 0 passed; 1 failed; 0 ignored;')) {
+              $observed++
+              Write-Output "C2_EXPECTED_NATURAL_OLD_ASSERTION_FAILURE round=$round survivors=[64,65]"
+            } else {
+              throw "Unexpected baseline failure in round $round (exit $testExit); inspect the saved output."
+            }
+          }
+          Write-Output "C2_NATURAL_RACE_OBSERVED=$observed/32; zero observations do not disprove the race."
+          # An observed old assertion failure is evidence, not this probe step's exit status.
+          exit 0
+      - name: Require deterministic reverse-order failure of old assertion
+        if: ${{ !cancelled() && env.C2_BASELINE_DIR != '' }}
+        working-directory: ${{ env.C2_BASELINE_DIR }}
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'c2-baseline-reverse-proof.log'
+          cargo test -p leonida-gpu --lib --release --locked $env:C2_REVERSE_TEST -- --exact --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          $testExit = $LASTEXITCODE
+          $text = Get-Content -Raw $log
+          if ($testExit -ne 101 -or
+              $text -notmatch [regex]::Escape($env:C2_EXECUTED_MARKER) -or
+              $text -notmatch [regex]::Escape($env:C2_OLD_ASSERTION) -or
+              $text -notmatch 'indirect budget: order=Some\(\[\s*64\s*,\s*0\s*\]\), survivors=\[\s*64\s*,\s*65\s*\], spent=134217728' -or
+              $text -notmatch [regex]::Escape('test result: FAILED. 0 passed; 1 failed; 0 ignored;')) {
+            throw 'Deterministic reverse-order proof did not execute and fail the old assertion with survivors [64,65].'
+          }
+          Write-Output 'C2_DETERMINISTIC_PROOF=expected old assertion failure with survivors [64,65]'
+          exit 0
