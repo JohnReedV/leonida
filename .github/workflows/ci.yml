@@ -24,6 +24,11 @@ jobs:
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Baseline loader tests, release
+        run: |
+          git fetch origin 0a1a17b7e0abf62db5abb6d66cb2c86bf575c579 --depth=1
+          git worktree add --detach ../leonida-baseline 0a1a17b7e0abf62db5abb6d66cb2c86bf575c579
+          cargo test --manifest-path ../leonida-baseline/Cargo.toml -p leonida-loader --release --locked
       - name: Loader tests, release
         run: cargo test -p leonida-loader --release --locked
       - name: Clippy
