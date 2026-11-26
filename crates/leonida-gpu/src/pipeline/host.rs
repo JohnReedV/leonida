@@ -1077,6 +1077,22 @@ mod tests {
             eprintln!("no host depth bounds support; skipped");
             return;
         }
+        let adapter = unsafe {
+            use windows::Win32::Graphics::Dxgi::{
+                CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+            };
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            factory
+                .EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
+                .unwrap()
+                .GetDesc1()
+                .unwrap()
+        };
+        eprintln!(
+            "depth-bounds adapter vendor={:#x} device={:#x} flags={:#x}",
+            adapter.VendorId, adapter.DeviceId, adapter.Flags
+        );
         let Some(dxc) = dxc() else {
             eprintln!("no PC dxc.exe; skipped");
             return;
@@ -1136,12 +1152,32 @@ mod tests {
         let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        let loaded_pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the depth-bounds pipeline was compiled again instead of loaded from the library"
         );
+        let mut depth_on = g.depth1();
+        depth_on.DepthEnable = true.into();
+        let depth_on_pso = graphics_depth_bounds_pipeline(
+            &host.device,
+            &root,
+            &desc,
+            depth_on,
+            &format!("{name}-depth-on"),
+        )
+        .expect("depth-enabled bounds PSO made");
+        let mut write_all = g.depth1();
+        write_all.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        let write_all_pso = graphics_depth_bounds_pipeline(
+            &host.device,
+            &root,
+            &desc,
+            write_all,
+            &format!("{name}-write-all"),
+        )
+        .expect("depth-write-all bounds PSO made");
 
         // Execute two draws against a depth buffer cleared to 0.5:
         // 1) bounds [0.6, 1.0] -> rejected (target stays 0)
@@ -1232,14 +1268,21 @@ mod tests {
             out.unwrap()
         };
 
-        let run_draw = |min: f32, max: f32| -> u8 {
+        let run_draw = |pso: &ID3D12PipelineState, min: f32, max: f32, mode: u8| -> u8 {
             let mut state = crate::draw::State::default();
             let first_list = host.new_list().unwrap();
             state.set_depth_bounds(&first_list, min, max);
             first_list.close();
             // Replay onto a second host list, exercising `State::replay`.
             let list = host.new_list().unwrap();
-            state.replay(&list);
+            use windows::core::Interface;
+            let list1 = list
+                .list
+                .cast::<ID3D12GraphicsCommandList1>()
+                .expect("host command list must expose depth-bounds API");
+            if mode == 0 {
+                state.replay(&list);
+            }
             let rtv = host.rtv(Some(&color), None);
             let dsv = host.dsv(&depth, None);
             let vp = D3D12_VIEWPORT {
@@ -1264,7 +1307,13 @@ mod tests {
                 list.list.RSSetViewports(&[vp]);
                 list.list.RSSetScissorRects(&[rect]);
                 list.list.SetGraphicsRootSignature(&root);
-                list.list.SetPipelineState(&pso);
+                if mode == 1 {
+                    state.replay(&list);
+                }
+                list.list.SetPipelineState(pso);
+                if mode == 2 {
+                    list1.OMSetDepthBounds(min, max);
+                }
                 list.list
                     .IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 list.list.DrawInstanced(3, 1, 0, 0);
@@ -1313,7 +1362,24 @@ mod tests {
             }
         };
 
-        assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
-        assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+        let variants = [
+            ("fresh", &pso),
+            ("loaded", &loaded_pso),
+            ("depth-on", &depth_on_pso),
+            ("write-all", &write_all_pso),
+        ];
+        let mut results = Vec::new();
+        for (name, pso) in variants {
+            for mode in 0..=2 {
+                let rejected = run_draw(pso, 0.6, 1.0, mode);
+                let accepted = run_draw(pso, 0.4, 0.6, mode);
+                eprintln!(
+                    "depth-bounds diagnostic pso={name} mode={mode} outside={rejected} inside={accepted}"
+                );
+                results.push((name, mode, rejected, accepted));
+            }
+        }
+        assert_eq!(results[0].2, 0, "original setup must reject depth 0.5 outside [0.6, 1.0]");
+        assert_eq!(results[0].3, 255, "original setup must pass depth 0.5 inside [0.4, 0.6]");
     }
 }
