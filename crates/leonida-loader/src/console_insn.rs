@@ -721,8 +721,8 @@ mod tests {
         };
         assert!(available != 0 && frequency > 0, "QPC frequency must be available");
         eprintln!("wait exceptions: QPC frequency={frequency} Hz");
-        const WARMUP: u64 = 2_000;
-        const PAIRS: u64 = 50_000;
+        const WARMUP: u64 = 20_000;
+        const PAIRS: u64 = 500_000;
         for threads in [1, 2, 4] {
             let start = std::sync::Barrier::new(threads);
             let before = EMULATED.load(Relaxed);
