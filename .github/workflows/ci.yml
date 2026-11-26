@@ -1,15 +1,14 @@
-name: CI
+name: P-3 native Windows validation
 
 on:
-  pull_request:
   push:
-    branches: [main]
+    branches: [codex/p3-copyback-ci]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: p3-copyback-ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -17,6 +16,7 @@ env:
 
 jobs:
   check:
+    if: github.repository != 'ProjectLeonidaL/leonida'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -24,10 +24,47 @@ jobs:
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --locked
       - name: Clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
+        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
-      - name: Tests
+      - name: Workspace tests
+        if: ${{ !cancelled() }}
         run: cargo test --workspace --locked
+
+  shadow:
+    if: github.repository != 'ProjectLeonidaL/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: 'false'
+      - name: Prepare baseline worktree
+        shell: pwsh
+        run: |
+          $baseline = Join-Path $env:RUNNER_TEMP 'leonida-p3-baseline'
+          git worktree add --detach $baseline 1e8e6a0e8ec1e1a978ef68e7907a65dad7a51376
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "P3_BASELINE_DIR=$baseline" >> $env:GITHUB_ENV
+          # Both revisions reuse dependencies outside either checkout.
+          $target = Join-Path $env:RUNNER_TEMP 'leonida-p3-shadow-target'
+          "CARGO_TARGET_DIR=$target" >> $env:GITHUB_ENV
+      - name: Baseline release shadow tests (1e8e6a0)
+        working-directory: ${{ env.P3_BASELINE_DIR }}
+        run: |
+          cargo test -p leonida-gpu --lib --release --locked shadow:: -- --nocapture --test-threads=1
+      - name: Patched release shadow tests
+        # Keep baseline failures visible while still testing the patched tree.
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test -p leonida-gpu --lib --release --locked shadow:: -- --nocapture --test-threads=1
