@@ -1320,7 +1320,8 @@ mod tests {
             // SAFETY: open command list, live resources and views.
             unsafe {
                 list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
-                list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+                let cleared_depth = if prime_depth { 1.0 } else { 0.5 };
+                list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, cleared_depth, 0, None);
                 list.list.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
                 list.list.RSSetViewports(&[vp]);
                 list.list.RSSetScissorRects(&[rect]);
