@@ -112,7 +112,10 @@ public static class LeonidaLauncherEnvironment {
 function Restore-LeonidaEnvironment([System.Collections.IDictionary]$Before) {
     $current = Save-LeonidaEnvironment
     foreach ($name in $current.Keys) {
-        if (-not $Before.Contains($name)) { [Environment]::SetEnvironmentVariable($name, $null) }
+        if (-not $Before.Contains($name)) {
+            # Plain $null binds as an empty string, which .NET 9+ preserves.
+            [Environment]::SetEnvironmentVariable($name, [NullString]::Value)
+        }
     }
     foreach ($name in $Before.Keys) {
         if (-not $current.Contains($name) -or $current[$name] -cne $Before[$name]) {
@@ -136,7 +139,7 @@ function Disable-LeonidaGraphics {
     $current = Save-LeonidaEnvironment
     foreach ($name in $current.Keys) {
         if ($name -notin $stay -and $name -notlike 'LEONIDA_RENDERDOC*') {
-            [Environment]::SetEnvironmentVariable($name, $null)
+            [Environment]::SetEnvironmentVariable($name, [NullString]::Value)
         }
     }
     $env:LEONIDA_GRAPHICS_OFF = '1'

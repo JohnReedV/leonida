@@ -92,14 +92,13 @@ cargo build --profile diag -p leonida --features diagnostics                   #
 
 If `cargo xtask` fails with "The directory name is invalid" after the folder was moved, run `cargo clean -p xtask`.
 
-## Known red, not yours
+## Test failures
 
-Clippy passes on `main` since #20 (TODO C-1). CI still fails on one test, `main` included:
-`pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws` fails on GitHub's runner and passes on an
-RTX 3080; the cause is not checked. The test of TODO C-2,
-`warp_budget_saturates_without_wraparound_and_preserves_draw_fields`, failed on some runs and passed on others.
-Compare against `main` before and after your change; a pull request must not add a new failure or warning. Fixing
-those is its own item, not something to fold into another pull request.
+Clippy passes on `main` since #20. The Windows runner's depth-bounds failure was fixed in #41.
+The C-2 indirect-budget test now checks lane order within each group without assuming which group
+runs first; controlled submissions cover both possible winners.
+Compare against `main` before and after your change; a pull request must not add a new failure or
+warning. Fixing an unrelated failure is its own item, not something to fold into another pull request.
 
 ## Conventions
 

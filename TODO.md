@@ -70,7 +70,6 @@ The goal: a console-like experience on PC. The game starts straight into play, h
 
 | ID | Task | Where | Needs |
 |----|------|-------|-------|
-| C-2 | Failing test `indirect::tests::warp_budget_saturates_without_wraparound_and_preserves_draw_fields`, inherited from victory-gta6. Upstream VIctory `4ab20fc` ("the indirect budget is charged in record order and no longer wraps") may fix it; not checked. | `leonida-gpu` | - |
 | C-3 | `cargo fmt --check` reports about 1,420 differences. Run `cargo fmt` once, in a pull request of its own, at a moment when no other pull request is open (it touches almost every file), then add the check to CI. | all | - |
 | C-4 | 163 `shortcut:` markers where the code approximates the console (79 in `leonida-gpu`, 55 in `leonida-shader`, 23 in `leonida-hle`, 4 in `leonida-formats`, 2 in `leonida-loader`). Replace them with the console's real behaviour, one per pull request. | all | game |
 | C-5 | Some style lints are switched off for this fork in the workspace `Cargo.toml`. Turn them back on and tidy the code they flag. | `Cargo.toml` | - |

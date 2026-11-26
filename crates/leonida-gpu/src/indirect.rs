@@ -2074,9 +2074,58 @@ void main() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
+        unordered_budget_saturation_cases(&mut warp);
+    }
+
+    #[test]
+    fn warp_budget_saturates_in_both_group_submission_orders() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        ordered_budget_saturation_cases(&mut warp);
+    }
+
+    #[test]
+    #[ignore = "requires a hardware GPU; no game files needed"]
+    fn host_budget_saturates_without_wraparound_and_preserves_draw_fields() {
+        let host = super::host().expect("a hardware GPU is required for this explicit test");
+        // SAFETY: querying the adapter associated with a live D3D12 device.
+        let desc = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .unwrap()
+                .EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
+                .unwrap()
+                .GetDesc1()
+                .unwrap()
+        };
+        assert_eq!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+        eprintln!(
+            "indirect budget saturation on {}",
+            String::from_utf16_lossy(&desc.Description).trim_end_matches('\0')
+        );
+        let mut gpu = WarpHarness::on_device(host.device.clone()).expect("hardware test harness");
+        unordered_budget_saturation_cases(&mut gpu);
+        ordered_budget_saturation_cases(&mut gpu);
+    }
+
+    fn unordered_budget_saturation_cases(warp: &mut WarpHarness) {
+        for _ in 0..16 {
+            budget_saturation_case(warp, None);
+        }
+        eprintln!("indirect budget saturation: 16 unordered cases executed");
+    }
+
+    fn ordered_budget_saturation_cases(warp: &mut WarpHarness) {
+        for order in [[0, 64], [64, 0]] {
+            budget_saturation_case(warp, Some(order));
+        }
+        eprintln!("indirect budget saturation: 2 ordered cases executed");
+    }
+
+    fn budget_saturation_case(warp: &mut WarpHarness, order: Option<[u32; 2]>) {
         const KIND_INDEXED: u32 = 1;
         const STRIDE: u32 = 24; // 5 indexed-draw words + 1 trailing custom word
-        const RECORDS: u32 = 128; // 2 waves of 64: old InterlockedAdd wrapped 2^32 at 64!
+        const RECORDS: u32 = 128; // Two thread groups; old InterlockedAdd wrapped at 64 records.
         const BUDGET_CAP: u32 = 1 << 27;
 
         let total_bytes = (STRIDE * RECORDS) as usize;
@@ -2092,10 +2141,10 @@ void main() {
             let words: [u32; 6] = [
                 if i == 0 { 1 << 24 } else { 1 << 22 }, // IndexCount
                 if i == 0 { 1 } else { u32::MAX }, // InstanceCount -> clamps to 16 (cost = 1 << 26)
-                1000 + i as u32,             // StartIndexLocation
-                (-200i32 + i as i32) as u32, // BaseVertexLocation
-                5000 + i as u32,             // StartInstanceLocation
-                0xCAFE_0000 | (i as u32),    // Extra stride word
+                1000 + i as u32,                   // StartIndexLocation
+                (-200i32 + i as i32) as u32,       // BaseVertexLocation
+                5000 + i as u32,                   // StartInstanceLocation
+                0xCAFE_0000 | (i as u32),          // Extra stride word
             ];
             let base = i * (STRIDE as usize);
             for (w, val) in words.into_iter().enumerate() {
@@ -2110,27 +2159,44 @@ void main() {
             std::ptr::write_bytes(readback_ptr, 0, total_bytes);
         }
 
-        assert!(record_clamp_as(
-            &warp.clamp,
-            &warp.list,
-            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
-            (&src_buf, 0),
-            None,
-            (KIND_INDEXED, STRIDE, RECORDS),
-            false,
-        ));
+        // The unordered case is one two-group dispatch. The ordered cases dispatch
+        // each half separately, sharing the budget and copying it to the original slots.
+        // Production UAV barriers order the two clamps, so either winner is deterministic.
+        let chunks = match order {
+            None => vec![(0, RECORDS)],
+            Some(firsts) => firsts.into_iter().map(|first| (first, 64)).collect(),
+        };
+        let mut before = D3D12_RESOURCE_STATE_COMMON;
+        for (first, records) in chunks {
+            let offset = u64::from(first * STRIDE);
+            assert!(record_clamp_as(
+                &warp.clamp,
+                &warp.list,
+                (&dst_buf, before),
+                budget_gpu,
+                (&src_buf, offset),
+                None,
+                (KIND_INDEXED, STRIDE, records),
+                false,
+            ));
 
-        // SAFETY: open command list; copy clamped scratch buffer (left
-        // readable as arguments) for verification.
-        unsafe {
-            warp.list.ResourceBarrier(&[transition(
-                &dst_buf,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            warp.list
-                .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total_bytes as u64);
+            // SAFETY: open command list; copy the clamped scratch records into their
+            // original slots. All resources stay alive through submit_and_wait below.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                warp.list.CopyBufferRegion(
+                    &readback_buf,
+                    offset,
+                    &dst_buf,
+                    0,
+                    u64::from(records * STRIDE),
+                );
+            }
+            before = D3D12_RESOURCE_STATE_COPY_SOURCE;
         }
         warp.submit_and_wait();
 
@@ -2152,12 +2218,19 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
+        let survivors: Vec<_> = out_words
+            .chunks_exact(6)
+            .enumerate()
+            .filter(|(_, rec)| rec[0] == (1 << 22) && rec[1] == 16)
+            .map(|(i, _)| i)
+            .collect();
+        eprintln!("indirect budget: order={order:?}, survivors={survivors:?}, spent={spent}");
+
         let mut kept = 0usize;
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
@@ -2169,6 +2242,20 @@ void main() {
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+
+        // A group reserves its records' budget atomically, then admits them in lane
+        // order. There is no execution order between groups in one dispatch: either
+        // group can take the whole budget. Separate dispatches force each alternative.
+        let allowed: &[[usize; 2]] = match order {
+            None => &[[1, 2], [64, 65]],
+            Some([0, 64]) => &[[1, 2]],
+            Some([64, 0]) => &[[64, 65]],
+            _ => unreachable!("only the two complete groups may be submitted"),
+        };
+        assert!(
+            allowed.iter().any(|pair| survivors == *pair),
+            "one group's first two real draws must fit: {survivors:?}, order={order:?}"
+        );
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's

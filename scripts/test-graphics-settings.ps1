@@ -55,6 +55,7 @@ $saved = Save-LeonidaEnvironment
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ('leonida-graphics-test-' + [guid]::NewGuid())
 try {
     Restore-LeonidaEnvironment @{}
+    Assert-Graphics ((Save-LeonidaEnvironment).Count -eq 0) 'cleanup left empty environment values'
     $script:queryMode = 'valid'
     $env:LEONIDA_ASYNC_SUBMIT = '0'
     $encodingBefore = [Console]::OutputEncoding.CodePage
@@ -121,7 +122,7 @@ try {
         $actual = [Environment]::GetEnvironmentVariables()
         Assert-Graphics (-not $actual.Contains('LEONIDA_NEW_EMPTY_TEST')) `
             'new empty override survived restoration'
-        [Environment]::SetEnvironmentVariable('LEONIDA_EMPTY_TEST', $null)
+        [Environment]::SetEnvironmentVariable('LEONIDA_EMPTY_TEST', [NullString]::Value)
     }
 
     $script:queryMode = 'stderr'
