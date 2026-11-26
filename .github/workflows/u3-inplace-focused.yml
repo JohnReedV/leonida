@@ -1,0 +1,186 @@
+name: U-3 bounded in-place lifetime probe
+'on':
+  push:
+    branches:
+    - codex/u3-inplace-focused-ci
+permissions:
+  contents: read
+concurrency:
+  group: u3-inplace-focused-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: never
+  U3_BASELINE_SHA: e8aa6152a4911e6e16e4077e29b9925d93da7b26
+  U3_PATCHED_SHA: 3d18f44a6f395248038986b0359f8078f8fa14b2
+  U3_SERIAL_TEST: inplace::u3_focused_validation::serial_100_original_cases
+  U3_PARALLEL_TEST: inplace::u3_focused_validation::parallel_4x25_original_cases
+jobs:
+  probe:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+    - run: rustup toolchain install
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: 'false'
+    - name: Build exact sources with identical appended test-only instrumentation
+      shell: pwsh
+      run: |-
+        Get-ChildItem Env:LEONIDA_* | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
+        git diff --exit-code $env:U3_BASELINE_SHA $env:U3_PATCHED_SHA -- crates/leonida-gpu/src/inplace.rs
+        if ($LASTEXITCODE -ne 0) { throw 'The original in-place source differs.' }
+        $builds = @()
+        $firstOriginalHash = $null
+        $firstInstrumentedHash = $null
+        foreach ($entry in @(@('baseline', $env:U3_BASELINE_SHA), @('patched', $env:U3_PATCHED_SHA))) {
+          $label, $sha = $entry
+          $directory = Join-Path $env:RUNNER_TEMP "leonida-u3-focused-$label"
+          $target = Join-Path $env:RUNNER_TEMP "leonida-u3-focused-target-$label"
+          git worktree add --detach $directory $sha
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Push-Location $directory
+          try {
+            git rev-parse HEAD
+            $file = Join-Path $directory 'crates/leonida-gpu/src/inplace.rs'
+            $original = [IO.File]::ReadAllText($file).Replace("`r`n", "`n")
+            $originalHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($original)))
+            if ($firstOriginalHash -and $firstOriginalHash -ne $originalHash) { throw 'Original source hashes differ.' }
+            $firstOriginalHash = $originalHash
+            $pattern = '(?s)    fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset\(\) \{(?<body>.*?)\n    \}\n\n    /// The census'
+            $match = [regex]::Match($original, $pattern)
+            if (-not $match.Success) { throw 'Could not isolate the exact original test body.' }
+            $body = $match.Groups['body'].Value
+            # Only capability handling and the existing decommit assertion are instrumented.
+            # Everything before/between device creation, fence waits, and drop(placed) is copied.
+            $oldCapability = @'
+                let Some(device) = warp() else { return };
+                if device.cast::<ID3D12Device13>().is_err() {
+                    return;
+                }
+        '@.Replace("`r`n", "`n").TrimEnd("`n")
+            $newCapability = @'
+                let device = warp().expect("U3 focused probe requires native WARP");
+                assert!(device.cast::<ID3D12Device13>().is_ok(), "U3 focused probe requires ID3D12Device13");
+        '@.Replace("`r`n", "`n").TrimEnd("`n")
+            if (([regex]::Matches($body, [regex]::Escape($oldCapability)).Count) -ne 1) { throw 'Capability replacement is not unique.' }
+            $body = $body.Replace($oldCapability, $newCapability)
+            $oldDecommit = '            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);'
+            $newDecommit = @'
+                    let decommit = mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT);
+                    // Capture the thread error before any other native call or logging.
+                    let error = if decommit == 0 { windows_sys::Win32::Foundation::GetLastError() } else { 0 };
+                    let completed = rig.fence.GetCompletedValue();
+                    eprintln!("U3_INPLACE_CASE worker={worker} round={round} decommit={decommit} error={error} fence={completed}/{}", rig.done);
+                    assert_ne!(decommit, 0, "original decommit assertion failed: worker={worker} round={round} GetLastError={error}");
+        '@.Replace("`r`n", "`n").TrimEnd("`n")
+            if (([regex]::Matches($body, [regex]::Escape($oldDecommit)).Count) -ne 1) { throw 'Decommit replacement is not unique.' }
+            $body = $body.Replace($oldDecommit, $newDecommit)
+            $header = @'
+
+        // External U-3 validation only. Original source above is preserved byte-for-byte
+        // after newline normalization; this module is never a production change.
+        #[cfg(test)]
+        mod u3_focused_validation {
+            use super::*;
+            use super::tests::warp;
+
+            fn original_case(worker: usize, round: usize) {
+        '@.Replace("`r`n", "`n").TrimEnd("`n")
+            $footer = @'
+            }
+
+            #[test]
+            #[ignore = "external bounded diagnostic probe"]
+            fn serial_100_original_cases() {
+                for round in 0..100 { original_case(0, round); }
+                eprintln!("U3_FOCUSED_SERIAL_COMPLETE=100");
+            }
+
+            #[test]
+            #[ignore = "external bounded diagnostic probe"]
+            fn parallel_4x25_original_cases() {
+                std::thread::scope(|scope| {
+                    for worker in 0..4 {
+                        scope.spawn(move || {
+                            for round in 0..25 { original_case(worker, round); }
+                        });
+                    }
+                });
+                eprintln!("U3_FOCUSED_PARALLEL_COMPLETE=100");
+            }
+        }
+        '@.Replace("`r`n", "`n")
+            $instrumented = $original + "`n" + $header + $body + "`n" + $footer + "`n"
+            if (-not $instrumented.StartsWith($original)) { throw 'Original source was altered.' }
+            $instrumentedHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($instrumented)))
+            if ($firstInstrumentedHash -and $firstInstrumentedHash -ne $instrumentedHash) { throw 'Instrumentation differs between revisions.' }
+            $firstInstrumentedHash = $instrumentedHash
+            [IO.File]::WriteAllText($file, $instrumented, [Text.UTF8Encoding]::new($false))
+            Write-Output "U3_FOCUSED_SOURCE label=$label sha=$sha original_sha256=$originalHash instrumented_sha256=$instrumentedHash"
+            git diff -- crates/leonida-gpu/src/inplace.rs
+            $env:CARGO_TARGET_DIR = $target
+            $messages = cargo test -p leonida-gpu --lib --locked --no-run --message-format=json
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $executables = @($messages | ForEach-Object { $_ | ConvertFrom-Json } |
+              Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'leonida_gpu' -and $_.executable } |
+              ForEach-Object { $_.executable })
+            if ($executables.Count -ne 1) { throw "Expected one $label test executable." }
+            $exe = $executables[0]
+            $tests = & $exe --list
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            foreach ($name in @($env:U3_SERIAL_TEST, $env:U3_PARALLEL_TEST)) {
+              if ($tests -notcontains ($name + ': test')) { throw "Missing focused probe: $name" }
+            }
+            $builds += [ordered]@{ label=$label; sha=$sha; executable=$exe; directory=$directory; original_sha256=$originalHash; instrumented_sha256=$instrumentedHash }
+          } finally { Pop-Location }
+        }
+        $manifest = Join-Path $env:RUNNER_TEMP 'u3-focused-builds.json'
+        $builds | ConvertTo-Json -Depth 4 | Set-Content $manifest
+        "U3_FOCUSED_MANIFEST=$manifest" >> $env:GITHUB_ENV
+        Get-Content $manifest
+    - name: Run 100 serial and 4x25 parallel cases per revision once
+      shell: pwsh
+      run: |-
+        Get-ChildItem Env:LEONIDA_* | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
+        $builds = @(Get-Content -Raw $env:U3_FOCUSED_MANIFEST | ConvertFrom-Json)
+        $results = [Collections.Generic.List[object]]::new()
+        $resultPath = Join-Path $env:RUNNER_TEMP 'u3-focused-results.json'
+        $phases = @(
+          @{ name='serial'; test=$env:U3_SERIAL_TEST; marker='U3_FOCUSED_SERIAL_COMPLETE=100'; builds=$builds },
+          @{ name='parallel'; test=$env:U3_PARALLEL_TEST; marker='U3_FOCUSED_PARALLEL_COMPLETE=100'; builds=@($builds[1], $builds[0]) }
+        )
+        foreach ($phase in $phases) {
+          foreach ($build in $phase.builds) {
+            $stem = "u3-focused-$($build.label)-$($phase.name)"
+            $stdout = Join-Path $env:RUNNER_TEMP ($stem + '.stdout.log')
+            $stderr = Join-Path $env:RUNNER_TEMP ($stem + '.stderr.log')
+            Write-Output "U3_FOCUSED_START label=$($build.label) sha=$($build.sha) phase=$($phase.name)"
+            $arguments = @($phase.test, '--exact', '--ignored', '--nocapture', '--test-threads=1')
+            $process = Start-Process -FilePath $build.executable -ArgumentList $arguments -WorkingDirectory $build.directory -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            [void]$process.Handle
+            $timedOut = -not $process.WaitForExit(120000)
+            if ($timedOut) { $process.Kill($true); $process.WaitForExit() }
+            $process.Refresh()
+            $code = if ($timedOut) { 124 } else { $process.ExitCode }
+            $text = (Get-Content -Raw $stdout) + "`n" + (Get-Content -Raw $stderr)
+            Write-Output $text
+            $cases = @([regex]::Matches($text, 'U3_INPLACE_CASE worker=(\d+) round=(\d+) decommit=(-?\d+) error=(\d+) fence=(\d+)/(\d+)'))
+            $failures = @($cases | Where-Object { [int]$_.Groups[3].Value -eq 0 } | ForEach-Object {
+              [ordered]@{ worker=[int]$_.Groups[1].Value; round=[int]$_.Groups[2].Value; last_error=[uint32]$_.Groups[4].Value; completed=[uint64]$_.Groups[5].Value; signalled=[uint64]$_.Groups[6].Value }
+            })
+            $passed = $code -eq 0 -and $cases.Count -eq 100 -and $failures.Count -eq 0 -and
+              $text.Contains($phase.marker) -and $text.Contains('test result: ok. 1 passed; 0 failed; 0 ignored;')
+            $row = [ordered]@{ label=$build.label; sha=$build.sha; phase=$phase.name; exit=$code; timed_out=$timedOut; complete=$passed; cases=$cases.Count; decommit_failures=$failures }
+            $results.Add($row)
+            $results | ConvertTo-Json -Depth 6 | Set-Content $resultPath
+            Write-Output ('U3_FOCUSED_RESULT=' + ($row | ConvertTo-Json -Compress -Depth 6))
+            # Continue all four planned processes even when one fails. Never retry it.
+          }
+        }
+        Get-Content $resultPath
+        Write-Output 'This bounded diagnostic run does not prove the absence of a race if no failure reproduces.'
+        if (@($results | Where-Object { -not $_.complete }).Count -ne 0) { exit 1 }
