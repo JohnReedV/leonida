@@ -97,7 +97,13 @@ fn run_title(
         .iter()
         .map(|m| m.dll.as_str())
         .collect();
-    let mapped: Vec<&str> = dlls.iter().map(|(name, _)| name.as_str()).collect();
+    let mapped: Vec<_> = dlls
+        .iter()
+        .map(|(name, dll)| {
+            let imports = dll.info().imports.iter().map(|m| m.dll.as_str()).collect();
+            (name.as_str(), imports)
+        })
+        .collect();
     let absent = absent_title_dlls(&imported, &mapped, &wanted);
     if !absent.is_empty() {
         let message = missing_dlls_message(&absent, title_dir);
@@ -246,20 +252,29 @@ fn check_avx2(has_avx2: bool) -> Result<()> {
     Ok(())
 }
 
-/// The DLLs among `imported` (the main image's static imports) that must
-/// come from the title's folder (`wanted`) but were not mapped from it:
-/// none of their imports can be bound. Each named once, case ignored.
+/// Missing title DLLs reachable through the main image's static imports.
+/// `mapped` includes delay-loaded DLLs too, but only static edges from a
+/// required image are followed. A delay-only dependency stays optional.
+/// Host/HLE modules are supplied elsewhere; cycles and case aliases are
+/// visited once. Direct missing imports keep their original order.
 #[cfg(any(windows, test))]
 fn absent_title_dlls(
     imported: &[&str],
-    mapped: &[&str],
+    mapped: &[(&str, Vec<&str>)],
     wanted: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
-    let mut absent: Vec<String> = Vec::new();
-    for &dll in imported {
-        let known = |list: &[&str]| list.iter().any(|m| m.eq_ignore_ascii_case(dll));
-        if wanted(dll) && !known(mapped) && !absent.iter().any(|a| a.eq_ignore_ascii_case(dll)) {
-            absent.push(dll.to_owned());
+    use std::collections::{HashSet, VecDeque};
+
+    let mut absent = Vec::new();
+    let mut visited = HashSet::new();
+    let mut pending: VecDeque<_> = imported.iter().copied().collect();
+    while let Some(dll) = pending.pop_front() {
+        if !wanted(dll) || !visited.insert(dll.to_ascii_lowercase()) {
+            continue;
+        }
+        match mapped.iter().find(|(name, _)| name.eq_ignore_ascii_case(dll)) {
+            Some((_, imports)) => pending.extend(imports.iter().copied()),
+            None => absent.push(dll.to_owned()),
         }
     }
     absent
@@ -453,7 +468,7 @@ mod message_tests {
             "Three.dll",
             "one.dll",
         ];
-        let absent = absent_title_dlls(&imported, &["TWO.DLL"], &wanted);
+        let absent = absent_title_dlls(&imported, &[("TWO.DLL", vec![])], &wanted);
         assert_eq!(absent, ["One.dll", "Three.dll"]);
         let message = missing_dlls_message(&absent, Path::new("D:\\Game"));
         assert!(
@@ -462,7 +477,7 @@ mod message_tests {
         );
         assert!(message.contains("D:\\Game"), "{message}");
         assert!(message.contains("LEONIDA_GAME_DIR"), "{message}");
-        assert!(absent_title_dlls(&["One.dll"], &["one.dll"], &wanted).is_empty());
+        assert!(absent_title_dlls(&["One.dll"], &[("one.dll", vec![])], &wanted).is_empty());
     }
 
     #[test]

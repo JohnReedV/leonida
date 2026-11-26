@@ -53,6 +53,30 @@ is claimed. These measurements cover synthetic cache overhead on this
 host under Wine, not actual translation time, native Windows filesystem
 performance, gameplay loading time or FPS.
 
+**U-6: report missing required DLLs before title initialization.**
+The startup check previously examined only the executable's direct imports.
+It now follows static imports through the mapped title DLLs, names each
+missing dependency once, and refuses execution before binding or running
+title code. Case aliases and cycles are visited once; host and HLE modules
+remain supplied by their existing resolvers. Only paths of static imports
+from the executable are required: a delay-only DLL remains optional.
+Inspection without `--execute` and the explicit `--unimplemented zero`
+override retain their behavior. Dynamic `LoadLibrary` handling and eager
+mapping of available delay-import DLLs are unchanged.
+
+An original generated executable imports a DLL that requires a missing
+second DLL. Its initializer calls `ExitProcess(73)` if reached. On baseline
+`f4c0707`, the public CLI reached that initializer; with the check it returns
+the missing-DLL error before binding. The test uses no game files.
+
+All ten public CLI startup tests passed in a Windows release build under
+Proton 11's Wine 11.0 on Pop!_OS 22.04, Intel Core i9-14900KS, Rust 1.98.1.
+They also cover a complete chain whose exports require DLL initialization,
+deeper missing imports, case aliases, cycles, shared dependencies, both
+delay-only cases, mixed required/optional paths, inspection, the explicit
+zero override, and host/HLE imports. Run them with
+`cargo test -p leonida --test startup --release --locked`.
+
 **U-3: graphics profiles are selected by the executable.**
 Direct `leonida run` and translation warm-up now resolve the same measured
 base profile that the launch scripts used, before the runtime caches its

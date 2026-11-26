@@ -91,6 +91,10 @@ The first run asks for the folder of your copy of the game (the one with `Micros
 `leonida.toml`, which git ignores. `leonida config` shows what is set, and `leonida.example.toml` lists the other
 settings.
 
+If startup names a missing game DLL, restore that file from your complete copy of the game, or choose the
+folder containing the complete installation. Leonida checks required DLLs, including dependencies of other
+DLLs, before running title code.
+
 `run-gta6.ps1` does the build and the run in one step. The program itself selects the frame-rate settings from
 `gpu-profiles.json`, including when launched directly through Wine. It asks for the game folder too, and whether
 to remember it:
