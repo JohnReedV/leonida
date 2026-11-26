@@ -2142,6 +2142,7 @@ mod merge_tests {
 
     /// Measures the whole production helper with reused scratch and a synthetic title-memory
     /// read. Includes identical input restoration each iteration; no GPU or game files needed.
+    /// Each case warms until a batch takes at least 50 ms, then times the same iteration count.
     /// Run `benchmark_copyback_pieces` alone in release mode with `--ignored --nocapture`.
     #[test]
     #[ignore = "manual CPU performance measurement; compare identical cases on both revisions"]
@@ -2190,10 +2191,17 @@ mod merge_tests {
                     );
                     black_box((result, &host, &title, &mask, &runs));
                 };
-                for _ in 0..100 {
-                    one();
+                let mut iterations = 100usize;
+                loop {
+                    let warming = std::time::Instant::now();
+                    for _ in 0..iterations {
+                        one();
+                    }
+                    if warming.elapsed() >= std::time::Duration::from_millis(50) {
+                        break;
+                    }
+                    iterations *= 2;
                 }
-                let iterations = (64 * 1024 * 1024 / n).min(100_000);
                 let began = std::time::Instant::now();
                 for _ in 0..iterations {
                     one();
