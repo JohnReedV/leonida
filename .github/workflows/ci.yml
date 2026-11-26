@@ -97,10 +97,10 @@ jobs:
         shell: pwsh
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'p2-warp-parity.log'
-          cargo test -p leonida-gpu --lib --release --locked indirect::tests::warp_single_records_match_grouped_arguments_and_budget -- --exact --nocapture --test-threads=1 2>&1 | Tee-Object -Variable output -FilePath $log
+          cargo test -p leonida-gpu --lib --release --locked indirect::tests::warp_single_records_match_grouped_arguments_and_budget -- --exact --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
           $testExit = $LASTEXITCODE
           if ($testExit -ne 0) { exit $testExit }
-          $text = $output -join "`n"
+          $text = Get-Content -Raw $log
           if ($text -notmatch [regex]::Escape('single-record clamp parity: 1624 cases, both pipelines executed')) {
             throw 'WARP parity did not execute all 1624 cases; a skipped or stale test is not a pass.'
           }
