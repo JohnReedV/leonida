@@ -1,18 +1,23 @@
 name: U-3 empty environment native probe
+
 on:
   push:
     branches: [codex/u3-empty-env-probe-ci]
+
 permissions:
   contents: read
+
 jobs:
   probe:
     if: github.repository == 'JohnReedV/leonida'
     runs-on: windows-latest
-    strategy:
-      matrix:
-        shell: [pwsh, powershell]
     steps:
       - uses: actions/checkout@v5
-      - name: Compare native and managed environment reads
-        shell: ${{ matrix.shell }}
-        run: '& ./.github/scripts/u3-empty-env-probe.ps1'
+      - name: Probe Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          & ./.github/scripts/u3-empty-env-probe.ps1
+      - name: Probe PowerShell 7
+        shell: pwsh
+        run: |
+          & ./.github/scripts/u3-empty-env-probe.ps1
