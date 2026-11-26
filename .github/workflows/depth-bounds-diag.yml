@@ -1,6 +1,7 @@
 name: Depth bounds diagnostic
 
 on:
+  workflow_dispatch:
   push:
     branches: [codex/r5-depth-bounds-diag]
 
