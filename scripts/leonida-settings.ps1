@@ -82,7 +82,12 @@ function Get-LeonidaGraphicsSwitches($Plan, [switch]$Short) {
 # script in the same PowerShell window. Restore the caller's values even after a failure.
 function Save-LeonidaEnvironment {
     $saved = @{}
-    Get-ChildItem Env:LEONIDA_* | ForEach-Object { $saved[$_.Name] = $_.Value }
+    # .NET Framework's single-variable getter (also used by Env:) can mistake an
+    # existing empty value for a missing one after a stale Win32 error. The full
+    # environment block preserves both presence and value without that lookup.
+    foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+        if ($entry.Key -like 'LEONIDA_*') { $saved[$entry.Key] = $entry.Value }
+    }
     $saved
 }
 
@@ -105,15 +110,17 @@ public static class LeonidaLauncherEnvironment {
 }
 
 function Restore-LeonidaEnvironment([System.Collections.IDictionary]$Before) {
-    Get-ChildItem Env:LEONIDA_* | Where-Object { -not $Before.Contains($_.Name) } |
-        ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
+    $current = Save-LeonidaEnvironment
+    foreach ($name in $current.Keys) {
+        if (-not $Before.Contains($name)) { [Environment]::SetEnvironmentVariable($name, $null) }
+    }
     foreach ($name in $Before.Keys) {
-        if ([Environment]::GetEnvironmentVariable($name) -cne $Before[$name]) {
+        if (-not $current.Contains($name) -or $current[$name] -cne $Before[$name]) {
             if ($Before[$name] -eq '' -and
                 [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 Set-LeonidaEmptyEnvironment $name
             } else {
-                Set-Item -LiteralPath "Env:$name" $Before[$name]
+                [Environment]::SetEnvironmentVariable($name, $Before[$name])
             }
         }
     }
@@ -126,9 +133,11 @@ function Disable-LeonidaGraphics {
         'LEONIDA_TEST_TITLES', 'LEONIDA_PROFILE', 'LEONIDA_LOG', 'LEONIDA_KEEP_WINDOW',
         'LEONIDA_GRAPHICS_OFF', 'LEONIDA_D3D12_WARP', 'LEONIDA_RELAUNCHED_FROM',
         'LEONIDA_AUDIO_CAPTURE_OF'
-    Get-ChildItem Env:LEONIDA_* | Where-Object {
-        $_.Name -notin $stay -and $_.Name -notlike 'LEONIDA_RENDERDOC*'
-    } |
-        ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
+    $current = Save-LeonidaEnvironment
+    foreach ($name in $current.Keys) {
+        if ($name -notin $stay -and $name -notlike 'LEONIDA_RENDERDOC*') {
+            [Environment]::SetEnvironmentVariable($name, $null)
+        }
+    }
     $env:LEONIDA_GRAPHICS_OFF = '1'
 }

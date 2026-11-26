@@ -51,11 +51,10 @@ function Invoke-SyntheticLeonida {
         ConvertTo-Json -Depth 4
 }
 
-$saved = @{}
-Get-ChildItem Env:LEONIDA_* | ForEach-Object { $saved[$_.Name] = $_.Value }
+$saved = Save-LeonidaEnvironment
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ('leonida-graphics-test-' + [guid]::NewGuid())
 try {
-    Get-ChildItem Env:LEONIDA_* | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
+    Restore-LeonidaEnvironment @{}
     $script:queryMode = 'valid'
     $env:LEONIDA_ASYNC_SUBMIT = '0'
     $encodingBefore = [Console]::OutputEncoding.CodePage
@@ -102,13 +101,27 @@ try {
 
     if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         Set-LeonidaEmptyEnvironment 'LEONIDA_EMPTY_TEST'
+        # Leave ERROR_ENVVAR_NOT_FOUND behind, which makes Framework's single-variable
+        # getter unreliable for empty values. Check the complete environment block instead.
+        $null = [Environment]::GetEnvironmentVariable('LEONIDA_NO_SUCH_EMPTY_TEST')
         $prior = Save-LeonidaEnvironment
+        Assert-Graphics ($prior.Contains('LEONIDA_EMPTY_TEST')) 'snapshot lost an empty override'
+        Assert-Graphics ($prior['LEONIDA_EMPTY_TEST'] -ceq '') 'snapshot changed an empty override'
         Disable-LeonidaGraphics
+        $actual = [Environment]::GetEnvironmentVariables()
+        Assert-Graphics (-not $actual.Contains('LEONIDA_EMPTY_TEST')) `
+            'baseline kept an empty runtime override'
         Restore-LeonidaEnvironment $prior
-        Assert-Graphics (Test-Path Env:LEONIDA_EMPTY_TEST) 'empty caller override was deleted'
-        Assert-Graphics ([Environment]::GetEnvironmentVariable('LEONIDA_EMPTY_TEST') -ceq '') `
+        $actual = [Environment]::GetEnvironmentVariables()
+        Assert-Graphics ($actual.Contains('LEONIDA_EMPTY_TEST')) 'empty caller override was deleted'
+        Assert-Graphics ($actual['LEONIDA_EMPTY_TEST'] -ceq '') `
             'empty caller override changed value'
-        Remove-Item Env:LEONIDA_EMPTY_TEST
+        Set-LeonidaEmptyEnvironment 'LEONIDA_NEW_EMPTY_TEST'
+        Restore-LeonidaEnvironment $prior
+        $actual = [Environment]::GetEnvironmentVariables()
+        Assert-Graphics (-not $actual.Contains('LEONIDA_NEW_EMPTY_TEST')) `
+            'new empty override survived restoration'
+        [Environment]::SetEnvironmentVariable('LEONIDA_EMPTY_TEST', $null)
     }
 
     $script:queryMode = 'stderr'
@@ -146,7 +159,7 @@ try {
 
     if ($Exe) {
         $Exe = (Resolve-Path -LiteralPath $Exe).Path
-        Get-ChildItem Env:LEONIDA_* | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
+        Restore-LeonidaEnvironment @{}
         [IO.Directory]::CreateDirectory($temporary) | Out-Null
         $env:LEONIDA_CONFIG = Join-Path $temporary 'leonida.toml'
         [IO.File]::WriteAllText($env:LEONIDA_CONFIG, '')
@@ -173,6 +186,20 @@ try {
                 'native Unicode profile was corrupted'
             Assert-Graphics ($plan.sources.LEONIDA_QUEUE2 -ceq "profile:$unicodeName") `
                 'native Unicode source was corrupted'
+            if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+                Set-LeonidaEmptyEnvironment 'LEONIDA_ASYNC_SUBMIT'
+                $prior = Save-LeonidaEnvironment
+                Disable-LeonidaGraphics
+                Restore-LeonidaEnvironment $prior
+                $plan = Get-LeonidaGraphics $Exe
+                $names = $plan.settings.PSObject.Properties.Name
+                Assert-Graphics ('LEONIDA_ASYNC_SUBMIT' -in $names) `
+                    'native child did not inherit the restored empty override'
+                Assert-Graphics ($plan.settings.LEONIDA_ASYNC_SUBMIT -ceq '') `
+                    'native child inherited the wrong empty override value'
+                Assert-Graphics ($plan.sources.LEONIDA_ASYNC_SUBMIT -eq 'environment') `
+                    'native child did not treat the empty override as explicit'
+            }
             Remove-Item Env:LEONIDA_PROFILE
             Disable-LeonidaGraphics
             $plan = Get-LeonidaGraphics $Exe
