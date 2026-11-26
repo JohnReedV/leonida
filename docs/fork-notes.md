@@ -38,8 +38,8 @@ Twelve paired rounds alternate implementation order and rotate payload
 sizes, after two warm-up passes. Each sample has 128 lookups. Misses use
 unique absent entries; the OS filesystem cache is not flushed. Every
 returned field, every stored byte and the translation/hit/miss counts are
-checked. All 144 samples are retained, including one slower patched 8 KiB
-miss sample. Miss times in microseconds per lookup:
+checked. All 144 samples are retained, including two slower patched 8 KiB
+miss pairs. Miss times in microseconds per lookup:
 
 | Synthetic payload | Before, median (range) | After, median (range) | Reduction in median |
 |-------------------|------------------------|-----------------------|---------------------|
