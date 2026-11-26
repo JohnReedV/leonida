@@ -1178,6 +1178,19 @@ mod tests {
             &format!("{name}-write-all"),
         )
         .expect("depth-write-all bounds PSO made");
+        let mut prime = g.depth1();
+        prime.DepthBoundsTestEnable = false.into();
+        prime.DepthEnable = true.into();
+        prime.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        prime.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        let prime_pso = graphics_depth_bounds_pipeline(
+            &host.device,
+            &root,
+            &desc,
+            prime,
+            &format!("{name}-prime-depth"),
+        )
+        .expect("depth-writing prime PSO made");
 
         // Execute two draws against a depth buffer cleared to 0.5:
         // 1) bounds [0.6, 1.0] -> rejected (target stays 0)
@@ -1268,7 +1281,12 @@ mod tests {
             out.unwrap()
         };
 
-        let run_draw = |pso: &ID3D12PipelineState, min: f32, max: f32, mode: u8| -> u8 {
+        let run_draw = |pso: &ID3D12PipelineState,
+                        min: f32,
+                        max: f32,
+                        mode: u8,
+                        prime_depth: bool|
+         -> u8 {
             let mut state = crate::draw::State::default();
             let first_list = host.new_list().unwrap();
             state.set_depth_bounds(&first_list, min, max);
@@ -1307,6 +1325,15 @@ mod tests {
                 list.list.RSSetViewports(&[vp]);
                 list.list.RSSetScissorRects(&[rect]);
                 list.list.SetGraphicsRootSignature(&root);
+                if prime_depth {
+                    // The Microsoft sample primes stored depth with a draw rather than a clear.
+                    list.list.SetPipelineState(&prime_pso);
+                    list.list.IASetPrimitiveTopology(
+                        windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                    );
+                    list.list.DrawInstanced(3, 1, 0, 0);
+                    list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                }
                 if mode == 1 {
                     state.replay(&list);
                 }
@@ -1371,14 +1398,19 @@ mod tests {
         let mut results = Vec::new();
         for (name, pso) in variants {
             for mode in 0..=2 {
-                let rejected = run_draw(pso, 0.6, 1.0, mode);
-                let accepted = run_draw(pso, 0.4, 0.6, mode);
+                let rejected = run_draw(pso, 0.6, 1.0, mode, false);
+                let accepted = run_draw(pso, 0.4, 0.6, mode, false);
                 eprintln!(
                     "depth-bounds diagnostic pso={name} mode={mode} outside={rejected} inside={accepted}"
                 );
                 results.push((name, mode, rejected, accepted));
             }
         }
+        let primed_outside = run_draw(&pso, 0.6, 1.0, 0, true);
+        let primed_inside = run_draw(&pso, 0.4, 0.6, 0, true);
+        eprintln!(
+            "depth-bounds diagnostic pso=fresh mode=0 primed=true outside={primed_outside} inside={primed_inside}"
+        );
         assert_eq!(results[0].2, 0, "original setup must reject depth 0.5 outside [0.6, 1.0]");
         assert_eq!(results[0].3, 255, "original setup must pass depth 0.5 inside [0.4, 0.6]");
     }

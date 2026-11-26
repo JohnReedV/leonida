@@ -14,24 +14,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
       - run: rustup toolchain install
-      - name: Prepare unmodified baseline
-        shell: pwsh
-        run: |
-          $baseline = Join-Path $env:RUNNER_TEMP 'leonida-depth-bounds-base'
-          git worktree add --detach $baseline e39a3138360b6a980a986ffc6a236d1905773b4c
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "BOUNDS_BASELINE=$baseline" >> $env:GITHUB_ENV
-      - name: Reproduce the original test in isolation
-        working-directory: ${{ env.BOUNDS_BASELINE }}
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/depth-bounds-baseline-target
+      - name: Compare depth clear and depth-writing draw
         run: cargo test -p leonida-gpu --lib --locked pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws -- --exact --nocapture --test-threads=1
-      - name: Compare bounds variants on the native Windows runner
-        if: ${{ !cancelled() }}
-        run: cargo test -p leonida-gpu --lib --locked pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws -- --exact --nocapture --test-threads=1
-      - name: Check whether full GPU suite changes the result
-        if: ${{ !cancelled() }}
-        run: cargo test -p leonida-gpu --lib --locked -- --nocapture
