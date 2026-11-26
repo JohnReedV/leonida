@@ -1,0 +1,222 @@
+name: U-6 native DLL preflight Windows validation
+
+on:
+  push:
+    branches: [codex/u6-dll-preflight-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: u6-dll-preflight-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  U6_BASELINE_SHA: a141614379a219aff2e4d86a0f243c304bb99cd5
+  U6_BASELINE_TEST: missing_transitive_static_dll_is_refused_before_initialization
+  U6_BASELINE_SENTINEL_MARKER: U6_STARTUP_CHILD_EXIT=73
+  U6_BASELINE_ASSERTION: "missing u6-b.dll was allowed to reach A's DllMain (ExitProcess sentinel 73)"
+  # Exact public CLI test inventory and post-assertion execution markers.
+  U6_STARTUP_TEST_TARGET: startup
+  U6_REQUIRED_TESTS: |
+    missing_transitive_static_dll_is_refused_before_initialization
+    complete_static_chain_initializes_dlls_and_runs_title
+    deeper_missing_static_dll_is_named_once_across_case_aliases
+    static_cycles_and_shared_dependencies_finish_startup
+    missing_direct_delay_import_stays_optional
+    present_delay_only_dll_can_have_an_absent_static_dependency
+    a_delay_path_does_not_hide_a_required_static_path
+    explicit_zero_policy_still_allows_missing_static_dependencies
+    inspection_reports_missing_static_dependencies_without_initializing_dlls
+    host_and_hle_imports_do_not_require_title_files
+  U6_EXECUTION_MARKERS: |
+    U6_STATIC_PREFLIGHT_REFUSED_BEFORE_DLLMAIN
+    U6_COMPLETE_STATIC_CHAIN_EXECUTED
+    U6_DELAY_ONLY_DEPENDENCY_REMAINED_OPTIONAL
+    U6_ZERO_POLICY_REACHED_DLLMAIN
+
+jobs:
+  check:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --locked
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Repository asset policy
+        if: ${{ !cancelled() }}
+        run: cargo xtask policy
+      - name: Workspace tests, every target
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $log = Join-Path $env:RUNNER_TEMP 'u6-workspace.log'
+          cargo test --workspace --all-targets --locked --no-fail-fast 2>&1 | Tee-Object -FilePath $log
+          exit $LASTEXITCODE
+      - name: Workspace documentation tests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --doc --locked --no-fail-fast
+
+  startup:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [default, diagnostics]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set isolated release target directory
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'leonida-u6-startup-${{ matrix.mode }}-target'
+          "CARGO_TARGET_DIR=$target" >> $env:GITHUB_ENV
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: 'false'
+      - name: Verify exact release startup test inventory
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $expected = @($env:U6_REQUIRED_TESTS -split '\r?\n' | Where-Object { $_.Trim() })
+          $markers = @($env:U6_EXECUTION_MARKERS -split '\r?\n' | Where-Object { $_.Trim() })
+          if ($expected.Count -eq 0 -or $markers.Count -eq 0 -or
+              $env:U6_REQUIRED_TESTS.Contains('PENDING_') -or $env:U6_EXECUTION_MARKERS.Contains('PENDING_')) {
+            throw 'The verifier must provide the exact startup test inventory and execution markers.'
+          }
+          if (@($expected | Sort-Object -Unique).Count -ne $expected.Count) {
+            throw 'The expected startup test inventory contains duplicate names.'
+          }
+          $arguments = @('test', '-p', 'leonida', '--test', $env:U6_STARTUP_TEST_TARGET, '--release', '--locked')
+          if ('${{ matrix.mode }}' -eq 'diagnostics') { $arguments += @('--features', 'diagnostics') }
+          $arguments += @('--', '--list', '--color', 'never')
+          $tests = & cargo @arguments
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests | Write-Output
+          $names = @($tests | ForEach-Object {
+            if ($_ -match '^(\S+): test$') { $Matches[1] }
+          })
+          $difference = @(Compare-Object -CaseSensitive -ReferenceObject $expected -DifferenceObject $names)
+          if ($names.Count -ne $expected.Count -or $difference.Count -ne 0) {
+            $difference | Format-Table | Out-String | Write-Output
+            throw "Startup test inventory mismatch: expected $($expected.Count), found $($names.Count)."
+          }
+          Write-Output "U6_STARTUP_INVENTORY mode=${{ matrix.mode }} count=$($names.Count)"
+      - name: Release startup suite and actual native execution markers
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $expected = @($env:U6_REQUIRED_TESTS -split '\r?\n' | Where-Object { $_.Trim() })
+          $markers = @($env:U6_EXECUTION_MARKERS -split '\r?\n' | Where-Object { $_.Trim() })
+          $arguments = @('test', '-p', 'leonida', '--test', $env:U6_STARTUP_TEST_TARGET, '--release', '--locked')
+          if ('${{ matrix.mode }}' -eq 'diagnostics') { $arguments += @('--features', 'diagnostics') }
+          $arguments += @('--', '--nocapture', '--test-threads=1', '--format', 'pretty', '--color', 'never')
+          $log = Join-Path $env:RUNNER_TEMP 'u6-startup-${{ matrix.mode }}.log'
+          & cargo @arguments 2>&1 | Tee-Object -FilePath $log
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { exit $testExit }
+          $text = Get-Content -Raw $log
+          $summaries = [regex]::Matches($text, '(?m)^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;')
+          if ($summaries.Count -ne 1 -or [int]$summaries[0].Groups[1].Value -ne $expected.Count -or
+              @($summaries[0].Groups[2..5] | Where-Object { $_.Value -ne '0' }).Count -ne 0) {
+            throw "Startup suite did not execute exactly $($expected.Count) passing, unfiltered tests."
+          }
+          foreach ($marker in $markers) {
+            if (-not $text.Contains($marker)) { throw "Missing native execution marker: $marker" }
+          }
+          Write-Output "U6_STARTUP_COMPLETE mode=${{ matrix.mode }} passed=$($expected.Count) ignored=0"
+
+  baseline_reproduction:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: 'false'
+      - name: Prepare exact upstream baseline with only public CLI test fixtures
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $baseline = Join-Path $env:RUNNER_TEMP 'leonida-u6-baseline'
+          $target = Join-Path $env:RUNNER_TEMP 'leonida-u6-baseline-target'
+          git worktree add --detach $baseline $env:U6_BASELINE_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $head = git -C $baseline rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($head -ne $env:U6_BASELINE_SHA) { throw 'The baseline is not the pinned upstream revision.' }
+          $testFile = "apps/leonida/tests/$($env:U6_STARTUP_TEST_TARGET).rs"
+          New-Item -ItemType Directory -Force (Join-Path $baseline 'apps/leonida/tests') | Out-Null
+          foreach ($file in @($testFile, 'apps/leonida/Cargo.toml', 'Cargo.lock')) {
+            Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $file) -Destination (Join-Path $baseline $file)
+          }
+          $changed = @(git -C $baseline diff --name-only)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $untracked = @(git -C $baseline ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (@($changed | Where-Object { $_ -notin @('apps/leonida/Cargo.toml', 'Cargo.lock') }).Count -ne 0 -or
+              $untracked.Count -ne 1 -or $untracked[0] -ne $testFile) {
+            throw 'The baseline contains changes beyond the CLI test and its test dependencies.'
+          }
+          git -C $baseline diff -- apps/leonida/Cargo.toml Cargo.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output "U6_BASELINE_SOURCE sha=$head production_source_unchanged=true"
+          "U6_BASELINE_DIR=$baseline" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$target" >> $env:GITHUB_ENV
+      - name: Verify exact baseline regression test exists
+        working-directory: ${{ env.U6_BASELINE_DIR }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          foreach ($value in @($env:U6_BASELINE_TEST, $env:U6_BASELINE_SENTINEL_MARKER, $env:U6_BASELINE_ASSERTION)) {
+            if (-not $value -or $value.Contains('PENDING_')) { throw 'The baseline regression manifest is incomplete.' }
+          }
+          $tests = cargo test -p leonida --test $env:U6_STARTUP_TEST_TARGET --release --locked $env:U6_BASELINE_TEST -- --exact --list --color never
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests | Write-Output
+          $names = @($tests | ForEach-Object { if ($_ -match '^(\S+): test$') { $Matches[1] } })
+          if ($names.Count -ne 1 -or $names[0] -ne $env:U6_BASELINE_TEST) {
+            throw 'The baseline did not contain exactly the intended regression test.'
+          }
+      - name: Reproduce the DLL initializer sentinel exactly once
+        working-directory: ${{ env.U6_BASELINE_DIR }}
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $log = Join-Path $env:RUNNER_TEMP 'u6-baseline-startup.log'
+          cargo test -p leonida --test $env:U6_STARTUP_TEST_TARGET --release --locked $env:U6_BASELINE_TEST -- --exact --nocapture --test-threads=1 --format pretty --color never 2>&1 | Tee-Object -FilePath $log
+          $testExit = $LASTEXITCODE
+          $text = Get-Content -Raw $log
+          $summary = [regex]::Matches($text, '(?m)^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; (\d+) filtered out;')
+          $expected = @($env:U6_REQUIRED_TESTS -split '\r?\n' | Where-Object { $_.Trim() })
+          if ($testExit -ne 101 -or $summary.Count -ne 1 -or
+              [int]$summary[0].Groups[1].Value -ne ($expected.Count - 1) -or
+              -not $text.Contains($env:U6_BASELINE_SENTINEL_MARKER) -or
+              -not $text.Contains($env:U6_BASELINE_ASSERTION)) {
+            throw "Baseline did not reproduce the specific early DLL initializer failure (Cargo exit $testExit)."
+          }
+          Write-Output 'U6_BASELINE_REPRODUCED child_exit=73 early_initializer=true runs=1'
+          # The expected failing test was classified above; this does not suppress any patched failure.
+          exit 0
