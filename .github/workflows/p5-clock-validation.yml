@@ -53,10 +53,10 @@ jobs:
         shell: pwsh
         run: |
           $baseline = Join-Path $env:RUNNER_TEMP 'leonida-p5-clock-baseline'
-          git worktree add --detach $baseline e39a3138360b6a980a986ffc6a236d1905773b4c
+          git worktree add --detach $baseline ac59d1418657d6d9a81a5b4c517550cfdaf0ad59
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "P5_BASELINE_DIR=$baseline" >> $env:GITHUB_ENV
-      - name: Baseline release loader unit and integration tests (e39a313)
+      - name: Baseline release loader unit and integration tests (ac59d14)
         working-directory: ${{ env.P5_BASELINE_DIR }}
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/leonida-p5-clock-baseline-target
@@ -79,7 +79,8 @@ jobs:
           # Require the new clock conversion and sampled-time boundary tests in this build.
           $required = @(
             'console_insn::tests::counter_microseconds_match_wide_arithmetic',
-            'console_insn::tests::wait_tracking_uses_sampled_time_and_preserves_boundaries'
+            'console_insn::tests::wait_tracking_uses_sampled_time_and_preserves_boundaries',
+            'console_insn::tests::monitor_wait_emulation_preserves_saved_context'
           )
           foreach ($name in $required) {
             if ($tests -notcontains ($name + ': test')) {
