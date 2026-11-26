@@ -195,32 +195,106 @@ fn diagnostics(image: &leonida_loader::LoadedImage, cfg: &leonida_core::Config) 
     );
 }
 
-/// Debugging aid: `LEONIDA_WATCH=<rva>,...` (hex) logs the u32 at each
-/// title+rva whenever it changes, polled every 5 ms (an engine's state, say).
+/// Debugging aid: `LEONIDA_WATCH=<rva>,*<pointer-rva>+<field-offset>,...` (hex)
+/// logs a u32 in the image or at a field of a pointer kept in the image.
+/// Image values are polled every 5 ms; indirect values every 50 ms to keep
+/// diagnostic reads from changing the timing of the title's streaming work.
+/// Values are printed only when they change.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("LEONIDA_WATCH") else {
         return;
     };
-    let rvas: Vec<usize> = list
-        .split(',')
-        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
-        .collect();
+    let specs: Vec<WatchSpec> = list.split(',').filter_map(|s| parse_watch(s, size)).collect();
+    if specs.is_empty() {
+        return;
+    }
     std::thread::spawn(move || {
-        let mut seen = vec![None; rvas.len()];
+        let mut seen = vec![None; specs.len()];
+        let mut ticks = 0u32;
         loop {
-            for (&rva, seen) in rvas.iter().zip(&mut seen) {
-                // SAFETY: four bytes inside the mapped image, checked above.
-                let value = unsafe { ((base + rva) as *const u32).read_volatile() };
-                if *seen != Some(value) {
-                    eprintln!("Leonida Legacy: title+{rva:#x} = {value:#x}");
-                    *seen = Some(value);
+            for (&spec, seen) in specs.iter().zip(&mut seen) {
+                if matches!(spec, WatchSpec::Indirect { .. }) && !ticks.is_multiple_of(10) {
+                    continue;
                 }
+                let Some(value) = read_watch(base, spec) else {
+                    continue;
+                };
+                if *seen == Some(value) {
+                    continue;
+                }
+                match spec {
+                    WatchSpec::Direct(rva) => {
+                        eprintln!("Leonida Legacy: title+{rva:#x} = {value:#x}");
+                    }
+                    WatchSpec::Indirect { pointer_rva, offset } => {
+                        eprintln!("Leonida Legacy: title+*{pointer_rva:#x}+{offset:#x} = {value:#x}");
+                    }
+                }
+                *seen = Some(value);
             }
+            ticks = ticks.wrapping_add(1);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+}
+
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchSpec {
+    Direct(usize),
+    Indirect { pointer_rva: usize, offset: usize },
+}
+
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+fn parse_watch(text: &str, image_size: usize) -> Option<WatchSpec> {
+    let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    if let Some(pointer) = text.trim().strip_prefix('*') {
+        let (pointer_rva, offset) = pointer.split_once('+')?;
+        let (pointer_rva, offset) = (hex(pointer_rva)?, hex(offset)?);
+        if pointer_rva.checked_add(8)? <= image_size && offset.checked_add(4).is_some() {
+            return Some(WatchSpec::Indirect { pointer_rva, offset });
+        }
+        return None;
+    }
+    let rva = hex(text)?;
+    (rva.checked_add(4)? <= image_size).then_some(WatchSpec::Direct(rva))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn read_watch(base: usize, spec: WatchSpec) -> Option<u32> {
+    let address = match spec {
+        WatchSpec::Direct(rva) => base.checked_add(rva)?,
+        WatchSpec::Indirect { pointer_rva, offset } => {
+            let pointer = u64::from_le_bytes(read_memory(base.checked_add(pointer_rva)?)?);
+            usize::try_from(pointer).ok()?.checked_add(offset)?
+        }
+    };
+    Some(u32::from_le_bytes(read_memory(address)?))
+}
+
+/// A failed or partial read can mean a pool has not been made yet, or was
+/// released between reading its pointer and its field. Neither faults the
+/// watcher, and the next poll can read the new allocation.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn read_memory<const N: usize>(address: usize) -> Option<[u8; N]> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut bytes = [0; N];
+    let mut read = 0;
+    // SAFETY: the destination is N writable bytes; ReadProcessMemory checks
+    // the source in this process and fails if it is not currently readable.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const _,
+            bytes.as_mut_ptr().cast(),
+            N,
+            &mut read,
+        )
+    };
+    (ok != 0 && read == N).then_some(bytes)
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
@@ -443,7 +517,26 @@ impl LoaderLock {
 mod message_tests {
     use std::path::Path;
 
-    use super::{absent_title_dlls, check_avx2, explain_commit_limit, missing_dlls_message};
+    use super::{
+        WatchSpec, absent_title_dlls, check_avx2, explain_commit_limit, missing_dlls_message,
+        parse_watch,
+    };
+
+    #[test]
+    fn watched_pool_fields_accept_a_pointer_inside_the_title() {
+        assert_eq!(parse_watch("10", 0x100), Some(WatchSpec::Direct(0x10)));
+        assert_eq!(
+            parse_watch("*0x20+0x0c", 0x100),
+            Some(WatchSpec::Indirect { pointer_rva: 0x20, offset: 0x0c })
+        );
+        assert_eq!(parse_watch("*0x20+0x10", 0x100), Some(WatchSpec::Indirect {
+            pointer_rva: 0x20,
+            offset: 0x10,
+        }));
+        assert_eq!(parse_watch("*0xFC+0x10", 0x100), None);
+        assert_eq!(parse_watch("0xFE", 0x100), None);
+        assert_eq!(parse_watch("*0x20+0xffffffffffffffff", 0x100), None);
+    }
 
     #[test]
     fn no_avx2_says_the_pc_cannot_run_it() {
@@ -501,6 +594,29 @@ mod message_tests {
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn watched_pointer_follows_the_current_allocation_and_survives_null() {
+        use super::{WatchSpec, read_watch};
+
+        let mut a = [0u32; 5];
+        let mut b = [0u32; 5];
+        a[3] = 120;
+        b[3] = 45000;
+        let mut pointer = a.as_ptr() as u64;
+        let base = (&pointer as *const u64) as usize;
+        let field = WatchSpec::Indirect { pointer_rva: 0, offset: 12 };
+        assert_eq!(read_watch(base, field), Some(120));
+        // SAFETY: this is a live, aligned local u64. A volatile write makes
+        // the replacement observable to ReadProcessMemory in an optimized test.
+        unsafe { std::ptr::write_volatile(&mut pointer, b.as_ptr() as u64) };
+        assert_eq!(read_watch(base, field), Some(45000));
+        // SAFETY: as above; null is the pool's state before initialization.
+        unsafe { std::ptr::write_volatile(&mut pointer, 0) };
+        assert_eq!(read_watch(base, field), None);
+        std::hint::black_box(pointer);
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
