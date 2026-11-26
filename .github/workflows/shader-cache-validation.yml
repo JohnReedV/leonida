@@ -14,7 +14,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: never
   SHADER_BASELINE_SHA: a141614379a219aff2e4d86a0f243c304bb99cd5
-  SHADER_PRODUCTION_SHA: ff305642ecaf2d4d7491fdd8701e72c5ca04b5c3
+  SHADER_PRODUCTION_SHA: ae91ac9d89a6789745a8b335b7eb35468b59a66e
   SHADER_WORKFLOW_PATH: .github/workflows/shader-cache-validation.yml
   SHADER_SOURCE_PATH: crates/leonida-gpu/src/shader_cache.rs
   SHADER_REQUIRED_TESTS: |
