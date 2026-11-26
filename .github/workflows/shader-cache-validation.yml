@@ -1,0 +1,250 @@
+name: UP-1 shader cache retention Windows validation
+
+on:
+  push:
+    branches: [codex/up1-shader-cache-retention-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shader-cache-retention-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  SHADER_BASELINE_SHA: a141614379a219aff2e4d86a0f243c304bb99cd5
+  SHADER_PRODUCTION_SHA: e72f2b1a348b9f952a5c942800f37561fc250614
+  SHADER_WORKFLOW_PATH: .github/workflows/shader-cache-validation.yml
+  SHADER_SOURCE_PATH: crates/leonida-gpu/src/shader_cache.rs
+  SHADER_REQUIRED_TESTS: |
+    shader_cache::tests::translations_come_back_from_the_cache
+    shader_cache::tests::entries_round_trip_and_reject_damage
+    shader_cache::tests::a_translation_survives_an_unwritable_cache
+    shader_cache::tests::a_translation_survives_failed_publication_without_leaving_a_staging_file
+    shader_cache::tests::translation_errors_are_reported_and_not_cached
+  SHADER_BASELINE_FAILURES: |
+    shader_cache::tests::a_translation_survives_an_unwritable_cache
+    shader_cache::tests::a_translation_survives_failed_publication_without_leaving_a_staging_file
+
+jobs:
+  check:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Verify exact production source identity
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ($env:SHADER_PRODUCTION_SHA -notmatch '^[0-9a-f]{40}$') {
+            throw 'Set the exact reviewed production commit before launching validation.'
+          }
+          $production = git rev-parse "$($env:SHADER_PRODUCTION_SHA)^{commit}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($production -ne $env:SHADER_PRODUCTION_SHA) { throw 'Production SHA is not exact.' }
+          $changes = @(git diff --name-only $production HEAD)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($changes.Count -ne 1 -or $changes[0] -ne $env:SHADER_WORKFLOW_PATH) {
+            $changes | Write-Output
+            throw 'The validation branch must differ from production only in this workflow.'
+          }
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output "SHADER_SOURCE_IDENTITY production=$production ci=$head workflow_only=true"
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --locked
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Repository asset policy
+        if: ${{ !cancelled() }}
+        run: cargo xtask policy
+      - name: Workspace tests, every target
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $log = Join-Path $env:RUNNER_TEMP 'shader-cache-workspace.log'
+          cargo test --workspace --all-targets --locked --no-fail-fast 2>&1 | Tee-Object -FilePath $log
+          exit $LASTEXITCODE
+      - name: Workspace documentation tests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --doc --locked --no-fail-fast
+
+  shader_cache:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [default, diagnostics]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set isolated release target directory
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'shader-cache-${{ matrix.mode }}-target'
+          "CARGO_TARGET_DIR=$target" >> $env:GITHUB_ENV
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: 'false'
+      - name: Verify exact release shader cache test inventory
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $expected = @($env:SHADER_REQUIRED_TESTS -split '\r?\n' | Where-Object { $_.Trim() })
+          if ($expected.Count -ne 5 -or @($expected | Sort-Object -Unique).Count -ne 5) {
+            throw 'The shader cache manifest must name all five distinct required tests.'
+          }
+          $arguments = @('test', '-p', 'leonida-gpu', '--lib', '--release', '--locked')
+          if ('${{ matrix.mode }}' -eq 'diagnostics') { $arguments += @('--features', 'diagnostics') }
+          $arguments += @('shader_cache::', '--', '--list', '--color', 'never')
+          $tests = & cargo @arguments
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests | Write-Output
+          $names = @($tests | ForEach-Object { if ($_ -match '^(\S+): test$') { $Matches[1] } })
+          $difference = @(Compare-Object -CaseSensitive -ReferenceObject $expected -DifferenceObject $names)
+          if ($names.Count -ne $expected.Count -or $difference.Count -ne 0) {
+            $difference | Format-Table | Out-String | Write-Output
+            throw "Shader cache inventory mismatch: expected $($expected.Count), found $($names.Count)."
+          }
+          Write-Output "SHADER_CACHE_INVENTORY mode=${{ matrix.mode }} count=$($names.Count)"
+      - name: Release shader cache tests, including write and publication failures
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $expected = @($env:SHADER_REQUIRED_TESTS -split '\r?\n' | Where-Object { $_.Trim() })
+          $arguments = @('test', '-p', 'leonida-gpu', '--lib', '--release', '--locked')
+          if ('${{ matrix.mode }}' -eq 'diagnostics') { $arguments += @('--features', 'diagnostics') }
+          $arguments += @('shader_cache::', '--', '--nocapture', '--test-threads=1', '--format', 'pretty', '--color', 'never')
+          $log = Join-Path $env:RUNNER_TEMP 'shader-cache-${{ matrix.mode }}.log'
+          & cargo @arguments 2>&1 | Tee-Object -FilePath $log
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { exit $testExit }
+          $text = Get-Content -Raw $log
+          $summaries = [regex]::Matches($text, '(?m)^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;')
+          if ($summaries.Count -ne 1 -or [int]$summaries[0].Groups[1].Value -ne $expected.Count -or
+              @($summaries[0].Groups[2..4] | Where-Object { $_.Value -ne '0' }).Count -ne 0) {
+            throw "Shader cache suite did not execute exactly $($expected.Count) passing, non-ignored tests."
+          }
+          foreach ($name in $expected) {
+            $pattern = '(?m)^test ' + [regex]::Escape($name) + ' \.\.\. ok\r?$'
+            if (-not [regex]::IsMatch($text, $pattern)) { throw "Missing passing test: $name" }
+          }
+          Write-Output "SHADER_CACHE_COMPLETE mode=${{ matrix.mode }} passed=$($expected.Count) ignored=0"
+
+  baseline_reproduction:
+    if: github.repository == 'JohnReedV/leonida'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: 'false'
+      - name: Prepare pinned baseline with only the final shader cache test module
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $baseline = Join-Path $env:RUNNER_TEMP 'shader-cache-baseline'
+          $target = Join-Path $env:RUNNER_TEMP 'shader-cache-baseline-target'
+          git worktree add --detach $baseline $env:SHADER_BASELINE_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $head = git -C $baseline rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($head -ne $env:SHADER_BASELINE_SHA) { throw 'Baseline is not the pinned upstream revision.' }
+          $baselineFile = Join-Path $baseline $env:SHADER_SOURCE_PATH
+          $patchedFile = Join-Path $env:GITHUB_WORKSPACE $env:SHADER_SOURCE_PATH
+          $before = [IO.File]::ReadAllText($baselineFile)
+          $patched = [IO.File]::ReadAllText($patchedFile)
+          $marker = '(?m)^#\[cfg\(test\)\]\r?\nmod tests \{'
+          $baseMatches = [regex]::Matches($before, $marker)
+          $patchedMatches = [regex]::Matches($patched, $marker)
+          if ($baseMatches.Count -ne 1 -or $patchedMatches.Count -ne 1) {
+            throw 'Expected one final cfg(test) module in each shader cache source.'
+          }
+          $prefix = $before.Substring(0, $baseMatches[0].Index)
+          $testModule = $patched.Substring($patchedMatches[0].Index)
+          $overlay = $prefix + $testModule
+          [IO.File]::WriteAllText($baselineFile, $overlay, [Text.UTF8Encoding]::new($false))
+          $after = [IO.File]::ReadAllText($baselineFile)
+          if (-not $after.StartsWith($prefix, [StringComparison]::Ordinal) -or
+              $after.Substring($prefix.Length) -cne $testModule) {
+            throw 'Baseline production prefix or test-module overlay changed unexpectedly.'
+          }
+          $changed = @(git -C $baseline diff --name-only)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $untracked = @(git -C $baseline ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($changed.Count -ne 1 -or $changed[0] -ne $env:SHADER_SOURCE_PATH -or $untracked.Count -ne 0) {
+            throw 'Baseline changes extend beyond the shader cache test module.'
+          }
+          git -C $baseline diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $prefixHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($prefix)))
+          $testHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($testModule)))
+          Write-Output "SHADER_BASELINE_SOURCE sha=$head production_prefix_unchanged=true prefix_sha256=$prefixHash tests_sha256=$testHash"
+          "SHADER_BASELINE_DIR=$baseline" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$target" >> $env:GITHUB_ENV
+      - name: Verify all five baseline tests exist
+        working-directory: ${{ env.SHADER_BASELINE_DIR }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $expected = @($env:SHADER_REQUIRED_TESTS -split '\r?\n' | Where-Object { $_.Trim() })
+          $tests = cargo test -p leonida-gpu --lib --release --locked shader_cache:: -- --list --color never
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests | Write-Output
+          $names = @($tests | ForEach-Object { if ($_ -match '^(\S+): test$') { $Matches[1] } })
+          $difference = @(Compare-Object -CaseSensitive -ReferenceObject $expected -DifferenceObject $names)
+          if ($expected.Count -ne 5 -or $names.Count -ne 5 -or $difference.Count -ne 0) {
+            throw 'The baseline did not contain exactly the same five shader cache tests.'
+          }
+      - name: Reproduce only the two intended baseline failures once
+        working-directory: ${{ env.SHADER_BASELINE_DIR }}
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $log = Join-Path $env:RUNNER_TEMP 'shader-cache-baseline.log'
+          cargo test -p leonida-gpu --lib --release --locked shader_cache:: -- --nocapture --test-threads=1 --format pretty --color never 2>&1 | Tee-Object -FilePath $log
+          $testExit = $LASTEXITCODE
+          $text = Get-Content -Raw $log
+          $summary = [regex]::Matches($text, '(?m)^test result: FAILED\. 3 passed; 2 failed; 0 ignored; 0 measured; (\d+) filtered out;')
+          if ($testExit -ne 101 -or $summary.Count -ne 1) {
+            throw "Baseline did not reproduce precisely three controls passing and two regressions failing (Cargo exit $testExit)."
+          }
+          $expected = @($env:SHADER_REQUIRED_TESTS -split '\r?\n' | Where-Object { $_.Trim() })
+          $failures = @($env:SHADER_BASELINE_FAILURES -split '\r?\n' | Where-Object { $_.Trim() })
+          if ($failures.Count -ne 2) { throw 'Expected precisely two baseline failure names.' }
+          foreach ($name in $failures) {
+            $escaped = [regex]::Escape($name)
+            $panic = "(?s)thread '" + $escaped + "'[^\r\n]* panicked at [^\r\n]*:\r?\nassertion .*? failed\r?\n\s*left: Err\([^\r\n]*\r?\n\s*right: Ok\(HostShader"
+            if (-not [regex]::IsMatch($text, $panic) -or
+                -not [regex]::IsMatch($text, '(?m)^    ' + $escaped + '\r?$')) {
+              throw "The specific Err-versus-Ok shader recovery assertion was not observed for $name."
+            }
+          }
+          foreach ($name in @($expected | Where-Object { $_ -notin $failures })) {
+            $pattern = '(?m)^test ' + [regex]::Escape($name) + ' \.\.\. ok\r?$'
+            if (-not [regex]::IsMatch($text, $pattern)) { throw "Baseline control did not pass: $name" }
+          }
+          Write-Output 'SHADER_BASELINE_REPRODUCED passed=3 expected_failures=2 ignored=0 runs=1'
+          # Only the explicitly classified baseline failures are expected; patched failures remain red.
+          exit 0
