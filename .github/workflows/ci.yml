@@ -35,7 +35,7 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Workspace tests
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
   shadow:
     if: github.repository != 'ProjectLeonidaL/leonida'
@@ -56,15 +56,38 @@ jobs:
           git worktree add --detach $baseline 1e8e6a0e8ec1e1a978ef68e7907a65dad7a51376
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "P3_BASELINE_DIR=$baseline" >> $env:GITHUB_ENV
-          # Both revisions reuse dependencies outside either checkout.
-          $target = Join-Path $env:RUNNER_TEMP 'leonida-p3-shadow-target'
-          "CARGO_TARGET_DIR=$target" >> $env:GITHUB_ENV
       - name: Baseline release shadow tests (1e8e6a0)
         working-directory: ${{ env.P3_BASELINE_DIR }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/leonida-p3-baseline-target
         run: |
           cargo test -p leonida-gpu --lib --release --locked shadow:: -- --nocapture --test-threads=1
+      - name: Verify patched release test binary
+        if: ${{ !cancelled() }}
+        env:
+          # Never reuse baseline artifacts: Cargo can regard older checkout mtimes as fresh.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/leonida-p3-patched-target
+        shell: pwsh
+        run: |
+          git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests = cargo test -p leonida-gpu --lib --release --locked shadow:: -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests | Write-Output
+          $required = @(
+            'shadow::merge_tests::copyback_runs_preserve_a_title_write_after_the_read',
+            'shadow::merge_tests::nonzero_runs_keep_exact_boundaries_for_every_byte_value',
+            'shadow::merge_tests::copyback_matches_scalar_merge_with_reused_scratch_and_failed_reads'
+          )
+          foreach ($name in $required) {
+            if ($tests -notcontains ($name + ': test')) {
+              throw "Patched release executable is missing required test: $name"
+            }
+          }
       - name: Patched release shadow tests
         # Keep baseline failures visible while still testing the patched tree.
         if: ${{ !cancelled() }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/leonida-p3-patched-target
         run: |
           cargo test -p leonida-gpu --lib --release --locked shadow:: -- --nocapture --test-threads=1
