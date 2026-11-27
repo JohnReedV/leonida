@@ -22,6 +22,7 @@
 
 <p align="center">
   <a href="#status">Status</a> |
+  <a href="#ready-made-builds">Ready-made builds</a> |
   <a href="#getting-started">Getting started</a> |
   <a href="#updating">Updating</a> |
   <a href="docs/notes/">Fork notes</a> |
@@ -73,9 +74,30 @@ Known problems:
 The full measurement log, what each switch does and the debugging options are in
 [docs/notes/](docs/notes/) (newest) and [docs/fork-notes.md](docs/fork-notes.md) (up to 2026-11-27).
 
+## Ready-made builds
+
+If you just want to play and don't want to build anything:
+
+1. Open [Releases](https://github.com/ProjectLeonidaL/leonida/releases) and download
+   `leonida-windows-x64.zip` from the newest **Build** (the highest number).
+2. Unpack it (right-click, **Extract All**) to a folder of its own, for example `C:\Leonida`.
+3. Double-click `leonida.exe` in the `leonida` folder. If Windows says it protected your PC, click
+   **More info**, then **Run anyway** (the file is not signed).
+4. The first time, it asks for the folder of your copy of the game: drag that folder from File Explorer
+   into the window and press Enter. Then press Enter to warm up the shader cache, and the game starts.
+
+You need Windows 10/11 x64, a CPU with AVX2 and a Direct3D 12 graphics card with shader model 6.6 and
+mesh shaders. When the game closes, or something goes wrong, the window says what happened and waits
+for Enter.
+
+**Updating a ready-made build:** download the newest Build zip, unpack it, and copy `leonida.toml`
+from your old `leonida` folder into the new one (it holds your game folder and settings). Saves stay in
+`%LOCALAPPDATA%\leonida` either way. The launcher will show when a newer build exists; it never updates
+by itself.
+
 ## Getting started
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and mesh shaders, Rust
+To build it yourself instead. Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and mesh shaders, Rust
 (pinned in `rust-toolchain.toml`), and several GiB of free Windows commit at startup (if `crashes.log` reports
 Windows error 1455, close other applications or make the paging file bigger).
 
@@ -300,8 +322,8 @@ the figures from `summary.txt`. Ordinary launches keep this profile off.
 
 ## Updating
 
-Get the newest version before you report a problem: it may already be fixed. In PowerShell, in the folder you
-cloned:
+Get the newest version before you report a problem: it may already be fixed. With a ready-made build, see
+[Ready-made builds](#ready-made-builds). In PowerShell, in the folder you cloned:
 
 ```powershell
 git switch main

@@ -6,6 +6,7 @@
 mod census;
 mod graphics;
 mod inspect;
+mod play;
 mod run;
 mod shader;
 mod translate;
@@ -15,19 +16,38 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// The build number the Release workflow sets (`git rev-list --count` of
+/// the commit), or `local` for a build made anywhere else.
+const BUILD: &str = match option_env!("RELEASE_BUILD_NUMBER") {
+    Some(n) if !n.is_empty() => n,
+    _ => "local",
+};
+
+/// The commit the Release workflow built, or `local`.
+const COMMIT: &str = match option_env!("RELEASE_BUILD_COMMIT") {
+    Some(c) if !c.is_empty() => c,
+    _ => "local",
+};
+
 #[derive(Parser)]
 #[command(
     name = "leonida",
     version,
-    about = "Run an Xbox Series title natively on Windows"
+    about = "Run an Xbox Series title natively on Windows. Without a command (as when \
+             leonida.exe is double-clicked), it asks what it needs and starts the game."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print this program's version, release build number and commit as
+    /// `key=value` lines (`local` for a build not made by the Release
+    /// workflow). The launcher compares the build number with the newest
+    /// release.
+    Version,
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
         file: PathBuf,
@@ -146,8 +166,14 @@ fn main() -> Result<()> {
     if leonida_hle::modules::audio::capture::child() {
         return Ok(());
     }
-    let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = Cli::parse().command else {
+        play::run();
+    };
+    match command {
+        Command::Version => {
+            print!("{}", version_text());
+            Ok(())
+        }
         Command::Inspect {
             file,
             imports,
@@ -245,9 +271,15 @@ fn default_exe() -> Result<PathBuf> {
 /// Asks for the game folder until one with a MicrosoftGame.config is given,
 /// then saves it.
 fn ask_game_dir() -> Result<PathBuf> {
-    use std::io::{BufRead, Write};
     println!("No game folder is set. Enter the folder of your copy of the game");
     println!("(the one with MicrosoftGame.config in it):");
+    read_game_dir()
+}
+
+/// Reads folders until one with a MicrosoftGame.config is given, then saves
+/// it.
+fn read_game_dir() -> Result<PathBuf> {
+    use std::io::{BufRead, Write};
     loop {
         print!("> ");
         std::io::stdout().flush()?;
@@ -301,6 +333,14 @@ fn manifest_exe(manifest: &str) -> Option<&str> {
     None
 }
 
+/// What `leonida version` prints.
+fn version_text() -> String {
+    format!(
+        "version={}\nbuild={BUILD}\ncommit={COMMIT}\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn show_config() -> Result<()> {
     let cfg = leonida_core::Config::load()?;
     let status = |p: &Option<PathBuf>| match p {
@@ -349,7 +389,43 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
-    use super::manifest_exe;
+    use clap::{CommandFactory, Parser};
+
+    use super::{Cli, Command, manifest_exe, version_text};
+
+    #[test]
+    fn the_command_line_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn no_arguments_is_no_command() {
+        let cli = Cli::try_parse_from(["leonida"]).unwrap();
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn version_is_a_command() {
+        let cli = Cli::try_parse_from(["leonida", "version"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Version)));
+        let cli = Cli::try_parse_from(["leonida", "run", "--execute"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { execute: true, .. })
+        ));
+    }
+
+    #[test]
+    fn version_text_is_three_key_value_lines() {
+        let text = version_text();
+        let keys: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|kv| kv.0)
+            .collect();
+        assert_eq!(keys, ["version", "build", "commit"]);
+        assert!(text.lines().all(|l| !l.ends_with('=')), "{text}");
+    }
 
     #[test]
     fn manifest_exe_is_the_first_executable() {
