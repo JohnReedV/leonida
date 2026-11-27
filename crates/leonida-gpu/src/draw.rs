@@ -1391,7 +1391,7 @@ impl State {
                     *value = self.binding_image_class(compute, &made, binding)
                         .unwrap_or(leonida_shader::emit::IMAGE_CLASS_LEGACY);
                     #[cfg(feature = "diagnostics")]
-                    if tracing::enabled!(tracing::Level::DEBUG) {
+                    if tracing::enabled!(target: "leonida_gpu::image_class", tracing::Level::DEBUG) {
                         static UINT: AtomicU64 = AtomicU64::new(0);
                         static LEGACY: AtomicU64 = AtomicU64::new(0);
                         let counter = if *value == leonida_shader::emit::IMAGE_CLASS_R32_UINT {
@@ -1402,6 +1402,7 @@ impl State {
                         let seen = counter.fetch_add(1, Ordering::Relaxed) + 1;
                         if seen.is_power_of_two() {
                             tracing::debug!(
+                                target: "leonida_gpu::image_class",
                                 shader = %stage.shader.hash,
                                 slot = binding.slot,
                                 dword = binding.dword,
