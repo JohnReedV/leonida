@@ -385,6 +385,77 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_kind(start, end, guarded).map(|(_, now, pages)| (now, pages))
+}
+
+/// How a texture's title memory is tracked. Private write-watched memory
+/// can be copied only when its pages changed; guarded views also need their
+/// periodic hash to catch writes through another alias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WatchSource {
+    Kernel,
+    Guard,
+}
+
+/// The texture path asks `writes(false)` and then `writes(true)` for a view.
+/// The first failed `GetWriteWatch` is redundant: the second asking can
+/// distinguish the two kinds itself. Keep the old path for an A/B run;
+/// `LEONIDA_TEXTURE_WATCH_ONCE=1` uses one classified asking per refresh.
+/// `alt` switches between them every twenty seconds in the same run.
+pub(crate) fn texture_writes(
+    start: usize,
+    end: usize,
+    guarded: bool,
+) -> Option<(WatchSource, u64, Vec<(usize, u64)>)> {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let once = match *MODE.get_or_init(|| {
+        match std::env::var("LEONIDA_TEXTURE_WATCH_ONCE").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        }
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "one classified texture write-watch asking from now \
+                     (LEONIDA_TEXTURE_WATCH_ONCE=alt): {}",
+                    if on { "ON" } else { "off, the two askings as before" }
+                );
+            }
+            on
+        }
+    };
+    if once {
+        return texture_writes_once(start, end, guarded);
+    }
+    if let Some((now, pages)) = writes(start, end, false) {
+        return Some((WatchSource::Kernel, now, pages));
+    }
+    guarded
+        .then(|| writes(start, end, true))
+        .flatten()
+        .map(|(now, pages)| (WatchSource::Guard, now, pages))
+}
+
+fn texture_writes_once(
+    start: usize,
+    end: usize,
+    guarded: bool,
+) -> Option<(WatchSource, u64, Vec<(usize, u64)>)> {
+    writes_kind(start, end, guarded)
+}
+
+fn writes_kind(
+    start: usize,
+    end: usize,
+    guarded: bool,
+) -> Option<(WatchSource, u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -393,6 +464,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
+            WatchSource::Kernel,
             j.ahead_asked,
             j.written
                 .range(first..last)
@@ -462,6 +534,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         j.written.insert(page, now);
     }
     Some((
+        if failed { WatchSource::Guard } else { WatchSource::Kernel },
         now,
         j.written
             .range(first..last)
@@ -1215,6 +1288,13 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    fn forget_test_pages(at: usize, len: usize) {
+        let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        for page in at / PAGE..(at + len).div_ceil(PAGE) {
+            journal.written.remove(&page);
+        }
+    }
+
     #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -1249,6 +1329,59 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn texture_watch_distinguishes_private_and_view_memory() {
+        // SAFETY: a fresh write-watched allocation, freed below.
+        let private = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(private, 0);
+        let (source, _, pages) = texture_writes_once(private, private + 2 * PAGE, true).unwrap();
+        assert_eq!(source, WatchSource::Kernel);
+        assert!(pages.is_empty());
+        // SAFETY: inside the committed allocation.
+        unsafe { ((private + PAGE + 8) as *mut u8).write_volatile(1) };
+        let (source, now, pages) = texture_writes_once(private, private + 2 * PAGE, true).unwrap();
+        assert_eq!(source, WatchSource::Kernel);
+        assert_eq!(pages, [(private / PAGE + 1, now)]);
+        assert_eq!(
+            texture_writes_once(private, private + 2 * PAGE, false).unwrap().0,
+            WatchSource::Kernel
+        );
+        forget_test_pages(private, 2 * PAGE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(private as *mut _, 0, MEM_RELEASE) };
+
+        let (section, one, two) = two_views(BLOCK);
+        let (source, now, pages) = texture_writes_once(one, one + BLOCK, true).unwrap();
+        assert_eq!(source, WatchSource::Guard);
+        assert_eq!(pages, [(one / PAGE, now)]);
+        let (source, later, pages) = texture_writes_once(one, one + BLOCK, true).unwrap();
+        assert_eq!(source, WatchSource::Guard);
+        assert!(later > now);
+        assert_eq!(pages, [(one / PAGE, now)]);
+        // A write through the other alias must still invalidate this view.
+        // SAFETY: the handler opens the guarded block before the write.
+        unsafe { ((two + 8) as *mut u8).write_volatile(2) };
+        let (source, changed, pages) = texture_writes_once(one, one + BLOCK, true).unwrap();
+        assert_eq!(source, WatchSource::Guard);
+        assert_eq!(pages, [(one / PAGE, changed)]);
+        assert!(texture_writes_once(one, one + BLOCK, false).is_none());
+        drop_views(section, &[one, two], BLOCK);
+        forget_test_pages(one, BLOCK);
+        forget_test_pages(two, BLOCK);
+
+        let mut plain = [0u8; 16];
+        let start = plain.as_mut_ptr() as usize;
+        assert!(texture_writes_once(start, start + plain.len(), true).is_none());
+        assert!(texture_writes_once(start, start + plain.len(), false).is_none());
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

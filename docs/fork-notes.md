@@ -5,6 +5,18 @@ The status summary is in [README.md](../README.md).
 
 ## Newest (2026-11-26)
 
+**P-3: one classified write-watch asking for each texture refresh (opt-in).**
+`LEONIDA_TEXTURE_WATCH_ONCE=1` asks once whether a texture's title memory
+is write-watched private memory or a guarded view. Previously the texture
+path first asked as if it were private and, when that failed, asked again
+with view guards enabled. The new path keeps the same private-memory copy
+and guarded-view hash rules while avoiding the first failed kernel asking
+for a view. `alt` alternates off and on every twenty seconds in one run,
+logging each change. It is off by default until a gameplay run checks the
+picture and frame times. Synthetic tests cover private writes, two views
+of one section, a write through the other view, and untracked memory.
+No gameplay improvement is claimed yet.
+
 **R-7: a lane mask copied back one half at a time.**
 `CS_TransmissionVolumetrics`, `CS_TransmissionVolumetricsSubmerged` and
 `PS_VoxelizeVisiblity` park a 64-bit lane mask in VGPR lanes and read it
