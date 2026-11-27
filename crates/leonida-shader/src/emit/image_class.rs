@@ -33,7 +33,8 @@ impl Lower<'_> {
                 == (RootType::Table, root.slot, root.user_data, dword)
         });
         let used = matches.next()?;
-        (used.kind == kind && used.dwords == 8 && used.stride == 0 && matches.next().is_none())
+        // The static SMEM address selects the image descriptor independently of stride metadata.
+        (used.kind == kind && used.dwords == 8 && matches.next().is_none())
             .then_some((root.slot, dword))
     }
 
@@ -348,6 +349,25 @@ mod tests {
     }
 
     #[test]
+    fn static_image_selection_does_not_use_declared_stride() {
+        let mut native = program();
+        let emit = |native: &NativeProgram| {
+            with_parts(native, |parts| lower_with_image_classes(parts, true).unwrap())
+        };
+        let expected = emit(&native);
+        assert_eq!(expected.image_bindings.len(), 1);
+        for stride in [4, 8] {
+            native.used[0].stride = stride;
+            let actual = emit(&native);
+            assert_eq!(
+                actual.image_bindings, expected.image_bindings,
+                "stride {stride}"
+            );
+            assert_eq!(actual.dxil, expected.dxil, "stride {stride}");
+        }
+    }
+
+    #[test]
     fn static_offset_matches_actual_smem_base_immediate_and_soffset_with_wrap() {
         let mut native = program();
         let mut code = vec![
@@ -525,7 +545,7 @@ mod tests {
         for variant in 0..4 {
             let mut native = program();
             match variant {
-                0 => native.used[0].stride = 8,
+                0 => native.used[0].kind = ResourceType::Cbv,
                 1 => native.used[0].user_data = 7,
                 2 => native.used.push(native.used[0]),
                 _ => native.used[0].dwords = 16,

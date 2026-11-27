@@ -1048,7 +1048,6 @@ fn image_bindings_match_tables(translated: &Translated) -> bool {
                     && view.table_offset_dwords == binding.dword
                     && view.kind == kind
                     && view.dwords == 8
-                    && view.stride == 0
             })
         })
 }
@@ -1106,13 +1105,19 @@ mod independent_root_tests {
             }],
             stores: false,
         };
-        assert!(image_bindings_match_tables(&translated));
+        for stride in [0, 4, 8] {
+            translated.used[0].stride = stride;
+            assert!(image_bindings_match_tables(&translated), "stride {stride}");
+        }
         translated.used[0].kind = ResourceType::Srv;
         assert!(!image_bindings_match_tables(&translated));
         translated.used[0].kind = ResourceType::Uav;
-        translated.used[0].stride = 8;
+        translated.used[0].dwords = 4;
         assert!(!image_bindings_match_tables(&translated));
-        translated.used[0].stride = 0;
+        translated.used[0].dwords = 8;
+        translated.used[0].table_offset_dwords = 16;
+        assert!(!image_bindings_match_tables(&translated));
+        translated.used[0].table_offset_dwords = 24;
         translated.host.user_data[0].slot = 1;
         assert!(!image_bindings_match_tables(&translated));
         translated.host.user_data[0].slot = 2;
