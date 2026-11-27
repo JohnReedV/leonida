@@ -435,18 +435,31 @@ pub(crate) fn check_image_classes(m: &Module, loads: usize, stores: usize) {
             assert!(matches!((body.term, m.blocks[alternate].term),
                 (Some(Term::Br(a)), Some(Term::Br(b))) if a == b));
             if store {
-                assert_eq!(m.int_value(*args.last().unwrap()), Some(1));
+                assert_eq!(m.int_value(*args.last().unwrap()), Some(15), "typed UAV store mask");
                 assert_eq!(m.int_value(args[5]).map(|v| v as u32), Some(0x8000_0000));
-                for &value in &args[6..9] {
-                    let V::Const(i) = value else { panic!("unused channel must be undef") };
-                    assert!(matches!(m.consts[i as usize].1, Const::Undef));
-                }
+                assert_eq!(args[6..9], [args[5]; 3], "typed scalar store values");
                 assert_eq!(m.int_value(*calls[0].last().unwrap()), Some(15));
             }
         }
     }
     assert_eq!(counts, [loads, stores]);
     check_phis(m);
+}
+
+/// Reproduce the one-component store in an otherwise identical authored module.
+#[cfg(windows)]
+pub(crate) fn force_incomplete_typed_store_mask(m: &mut Module) {
+    let mut stores = m.insts.iter().enumerate().filter_map(|(index, inst)| {
+        let Op::Call(function, args) = &inst.op else { return None; };
+        (m.funcs[*function as usize].name == "dx.op.textureStore.i32").then(|| (index, args[5]))
+    });
+    let (index, x) = stores.next().expect("authored direct typed store");
+    assert!(stores.next().is_none());
+    let undef = m.undef(m.type_of(x));
+    let mask = m.i8(1);
+    let Op::Call(_, args) = &mut m.insts[index].op else { unreachable!() };
+    args[6..9].fill(undef);
+    args[9] = mask;
 }
 
 /// Evaluate the emitted table-index arithmetic for an authored static SMEM descriptor load.

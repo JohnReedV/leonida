@@ -167,6 +167,50 @@ fn shader_for(input_kind: ResourceType, store: Store) -> emit::HostShader {
     shader
 }
 
+#[cfg(windows)]
+fn validated_volume_shaders() -> Vec<(Store, [emit::HostShader; 2])> {
+    use leonida_shader::emit::validator::Validator;
+
+    assert_eq!(std::env::var("LEONIDA_UINT_IMAGES").as_deref(), Ok("1"));
+    let path = std::env::var_os("LEONIDA_DXIL_VALIDATOR")
+        .map(std::path::PathBuf::from)
+        .or_else(Validator::default_path);
+    let mut validator = Validator::load(path.as_deref())
+        .expect("SDK validator required: set LEONIDA_DXIL_VALIDATOR to dxil.dll");
+    eprintln!(
+        "uint-image SDK validator: {}",
+        path.as_deref().unwrap_or_else(|| std::path::Path::new("dxil.dll")).display()
+    );
+
+    let programs: Vec<_> = [Store::Computed, Store::Runtime]
+        .into_iter()
+        .chain(SPECIAL.into_iter().map(Store::Literal))
+        .map(|store| {
+            let shaders = [ResourceType::Srv, ResourceType::Uav].map(|kind| {
+                let mut shader = shader_for(kind, store);
+                assert_eq!(shader.image_bindings.len(), 2);
+                validator.validate(&mut shader.dxil).unwrap_or_else(|error| {
+                    panic!("SDK rejected authored {store:?} {kind:?} shader: {error}")
+                });
+                shader
+            });
+            (store, shaders)
+        })
+        .collect();
+    eprintln!("uint-image SDK validated {} authored shaders", programs.len() * 2);
+    programs
+}
+
+#[cfg(windows)]
+#[test]
+fn sdk_validates_all_integer_volume_variants() {
+    if std::env::var_os("LEONIDA_DXIL_VALIDATOR").is_none() {
+        eprintln!("skipped: set LEONIDA_DXIL_VALIDATOR to the SDK dxil.dll");
+        return;
+    }
+    assert_eq!(validated_volume_shaders().len(), 8);
+}
+
 #[test]
 fn authored_3d_special_words_keep_literal_and_runtime_stores_separate() {
     for store in std::iter::once(Store::Runtime).chain(SPECIAL.into_iter().map(Store::Literal)) {

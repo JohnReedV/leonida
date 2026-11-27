@@ -122,8 +122,9 @@ impl Lower<'_> {
         if store {
             let mut args = vec![ih];
             args.extend(cs);
-            args.extend([raw, iu, iu, iu]);
-            args.push(self.s.m.i8(1)); // R32_UINT has one writable component.
+            // DXIL requires all four operands of a typed UAV store, even for scalar views.
+            args.extend([raw; 4]);
+            args.push(self.s.m.i8(0xf));
             self.s.op(
                 int_block,
                 "textureStore.i32",
@@ -299,6 +300,32 @@ mod tests {
                     .expect("DXIL validator");
             }
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sdk_rejects_incomplete_typed_store_mask() {
+        let Some(path) = std::env::var_os("LEONIDA_DXIL_VALIDATOR") else {
+            eprintln!("skipped: set LEONIDA_DXIL_VALIDATOR to the SDK dxil.dll");
+            return;
+        };
+        let path = std::path::Path::new(&path);
+        let mut validator = super::super::super::validator::Validator::load(Some(path))
+            .expect("load configured SDK validator");
+        let mut broken = with_parts(&program(), |parts| {
+            let bad = HashMap::new();
+            let mut lower = Lower::new(parts, &bad);
+            lower.uint_images = true;
+            lower.body().unwrap_or_else(|_| panic!("authored lowering"));
+            super::super::super::bitcode::execute::force_incomplete_typed_store_mask(&mut lower.s.m);
+            lower.s.finish()
+        });
+        let error = validator.validate(&mut broken).expect_err("DXIL must reject the mask");
+        assert!(
+            error.contains("store on typed uav must write to all four components of the UAV"),
+            "unexpected validator error: {error}"
+        );
+        eprintln!("SDK rejected the authored incomplete typed store mask");
     }
 
     #[test]

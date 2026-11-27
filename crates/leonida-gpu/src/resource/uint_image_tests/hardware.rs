@@ -1,9 +1,9 @@
 //! Separate uploaded image loads and literal/runtime stores on a real D3D12 device.
 
-use super::{DEPTH, HEIGHT, SPECIAL, Store, WIDTH, WORDS, shader_for};
+use super::{DEPTH, HEIGHT, SPECIAL, Store, WIDTH, WORDS, validated_volume_shaders};
 use crate::descriptor::{View, host::HostHeap};
 use crate::host::transition;
-use leonida_shader::native::ResourceType;
+use leonida_shader::emit::HostShader;
 use std::time::{Duration, Instant};
 use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*, Dxgi::*};
 use windows::core::Interface;
@@ -148,36 +148,22 @@ fn integer_volumes_preserve_literal_and_runtime_bits() {
         eprintln!("skipped: set LEONIDA_TEST_UINT_IMAGES=hardware");
         return;
     }
-    assert_eq!(std::env::var("LEONIDA_UINT_IMAGES").as_deref(), Ok("1"));
-    run(Store::Computed);
-    for store in std::iter::once(Store::Runtime).chain(SPECIAL.into_iter().map(Store::Literal)) {
-        run(store);
+    let programs = validated_volume_shaders();
+    for (store, shaders) in programs {
+        run(store, shaders);
     }
     eprintln!("uint-image suite complete: 32 cases, 104 load and store words per case");
 }
 
-fn run(store: Store) {
+fn run(store: Store, [srv, uav]: [HostShader; 2]) {
     assert_ne!(std::env::var("LEONIDA_D3D12_WARP").as_deref(), Ok("1"));
-    let mut shaders = Vec::new();
+    let shaders = [&srv, &srv, &uav, &uav];
     let cases = [
         ("srv-f32", false),
         ("srv-uint", false),
         ("uav-f32", true),
         ("uav-uint", true),
     ];
-    for (i, (_, uav)) in cases.iter().enumerate() {
-        let kind = if *uav {
-            ResourceType::Uav
-        } else {
-            ResourceType::Srv
-        };
-        shaders.push(shader_for(kind, store));
-        assert_eq!(shaders[i].image_bindings.len(), 2);
-        if i % 2 != 0 {
-            assert_eq!(shaders[i - 1].user_data, shaders[i].user_data);
-            assert_eq!(shaders[i - 1].dxil, shaders[i].dxil);
-        }
-    }
     let host = crate::host::host().expect("explicit hardware test needs a device");
     // SAFETY: query the adapter of the retained device used below.
     let adapter = unsafe {
