@@ -2302,6 +2302,7 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        self.s.m.expand_guarded_stores();
         if let Some(prologue) = self.wave_counter_entry {
             self.s.m.prepend_entry(prologue);
         }
@@ -3813,7 +3814,17 @@ impl<'a> Lower<'a> {
         if self.x.independent_waves.is_some() {
             self.s.m.atomic(at, Rmw::Xchg, ptr, mine);
         } else {
-            self.s.m.store(at, ptr, mine);
+            // Identical ordinary stores still race. Elect one active lane per host wave;
+            // the deferred split guards only the store, never either group rendezvous.
+            let first = self.s.op(
+                at,
+                "waveIsFirstLane",
+                Attr::NoUnwind,
+                self.s.t.i1,
+                110,
+                &[],
+            );
+            self.s.m.guarded_store(at, first, ptr, mine);
         }
         self.group_sync(at);
         let one = self.s.m.i32(1);
@@ -5514,3 +5525,7 @@ mod tests {
 #[cfg(test)]
 #[path = "dpp_row_tests.rs"]
 mod dpp_row_tests;
+
+#[cfg(test)]
+#[path = "mailbox_tests.rs"]
+mod mailbox_tests;

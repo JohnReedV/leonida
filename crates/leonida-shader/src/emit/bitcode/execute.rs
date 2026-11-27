@@ -5,6 +5,7 @@ use super::*;
 pub(crate) struct Execution {
     pub blocks: Vec<usize>,
     pub values: HashMap<V, u32>,
+    pub stores: Vec<(V, u32)>,
     pub discarded: bool,
 }
 
@@ -116,6 +117,7 @@ pub(crate) fn run(m: &Module, budget: usize) -> Execution {
     let mut result = Execution {
         blocks: Vec::new(),
         values: HashMap::new(),
+        stores: Vec::new(),
         discarded: false,
     };
     let (mut at, mut previous) = (0, None);
@@ -158,6 +160,10 @@ pub(crate) fn run(m: &Module, budget: usize) -> Execution {
                     _ => panic!("unexpected comparison {op}"),
                 }),
                 Op::Select(c, t, f) => get(if get(*c) != 0 { *t } else { *f }),
+                Op::Store(ptr, value) => {
+                    result.stores.push((*ptr, get(*value)));
+                    0
+                }
                 Op::Call(f, args) if m.funcs[*f as usize].name == "dx.op.discard" => {
                     result.discarded |= get(args[1]) != 0;
                     0
@@ -187,9 +193,28 @@ pub(crate) fn run(m: &Module, budget: usize) -> Execution {
 /// the entry wave-allocation atomic is modeled: its returned base identifies
 /// this physical wave. This checks emitted data dependencies, not GPU barriers.
 pub(crate) fn lane_value(m: &Module, value: V, lane: u32, base: u32, width: u32) -> u32 {
-    fn eval(m: &Module, value: V, lane: u32, base: u32, width: u32, left: usize) -> u32 {
+    lane_value_with_lds(m, value, lane, base, width, &HashMap::new())
+}
+
+fn lane_value_with_lds(
+    m: &Module,
+    value: V,
+    lane: u32,
+    base: u32,
+    width: u32,
+    memory: &HashMap<(V, u32), u32>,
+) -> u32 {
+    fn eval(
+        m: &Module,
+        value: V,
+        lane: u32,
+        base: u32,
+        width: u32,
+        memory: &HashMap<(V, u32), u32>,
+        left: usize,
+    ) -> u32 {
         assert!(left != 0, "lane expression exceeds its evaluation budget");
-        let get = |v| eval(m, v, lane, base, width, left - 1);
+        let get = |v| eval(m, v, lane, base, width, memory, left - 1);
         let V::Inst(id) = value else {
             return word(m, &HashMap::new(), value);
         };
@@ -216,6 +241,18 @@ pub(crate) fn lane_value(m: &Module, value: V, lane: u32, base: u32, width: u32)
             }),
             Op::Select(c, t, f) => get(if get(*c) != 0 { *t } else { *f }),
             Op::Cast(Cast::Bitcast | Cast::ZExt | Cast::Trunc, v) => get(*v),
+            Op::Load(ptr) => {
+                let V::Inst(id) = ptr else {
+                    panic!("expected LDS GEP")
+                };
+                let Op::Gep(_, global, indices) = &m.insts[*id as usize].op else {
+                    panic!("expected LDS GEP")
+                };
+                let index = get(*indices.last().unwrap());
+                *memory
+                    .get(&(*global, index))
+                    .expect("LDS value must be published")
+            }
             Op::AtomicRmw(Rmw::Add, _, amount) => {
                 assert_eq!(lane, 0, "only wave-first allocation result is observed");
                 assert_eq!(get(*amount), 32);
@@ -223,20 +260,146 @@ pub(crate) fn lane_value(m: &Module, value: V, lane: u32, base: u32, width: u32)
             }
             Op::Call(f, args) => match m.funcs[*f as usize].name.as_str() {
                 "dx.op.waveGetLaneIndex" => lane,
+                "dx.op.waveIsFirstLane" => u32::from(lane == 0),
                 "dx.op.flattenedThreadIdInGroup.i32" => base + lane,
-                "dx.op.waveReadLaneFirst.i32" => eval(m, args[1], 0, base, width, left - 1),
+                "dx.op.waveReadLaneFirst.i32" => eval(m, args[1], 0, base, width, memory, left - 1),
                 "dx.op.waveReadLaneAt.i32" => {
                     let source = get(args[2]);
                     assert!(
                         source < width,
                         "shuffle source must stay within physical wave"
                     );
-                    eval(m, args[1], source, base, width, left - 1)
+                    eval(m, args[1], source, base, width, memory, left - 1)
+                }
+                "dx.op.waveActiveBit.i32" => {
+                    assert_eq!(get(args[0]), 120);
+                    assert_eq!(get(args[2]), 1, "authored reduction is bitwise OR");
+                    (0..width).fold(0, |result, source| {
+                        result | eval(m, args[1], source, base, width, memory, left - 1)
+                    })
                 }
                 name => panic!("unexpected lane call {name}"),
             },
             op => panic!("unexpected lane expression {op:?}"),
         }
     }
-    eval(m, value, lane, base, width, 512)
+    eval(m, value, lane, base, width, memory, 512)
+}
+
+/// Inspect the actual emitted mailbox diamond and evaluate its two different half-results.
+/// This is a CPU data-dependency/CFG check, not a model of GPU scheduling or memory ordering.
+pub(crate) fn check_wave_mailboxes(m: &Module, output: V, barrier_mode: u32) {
+    check_phis(m);
+    let constant = |v| word(m, &HashMap::new(), v);
+    let stores: Vec<_> = m
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(block, b)| {
+            b.body
+                .iter()
+                .filter_map(move |&id| match m.insts[id as usize].op {
+                    Op::Store(ptr, value) if m.int_value(value) != Some(0) => {
+                        Some((block, id, ptr, value))
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+    assert_eq!(
+        stores.len(),
+        1,
+        "one authored reduction must use one mailbox store"
+    );
+    let (store_block, store_id, ptr, mine) = stores[0];
+    assert_eq!(
+        m.blocks[store_block].body,
+        [store_id],
+        "only the mailbox store is conditional"
+    );
+    let Some(Term::Br(join)) = m.blocks[store_block].term else {
+        panic!("mailbox writer must rejoin every lane")
+    };
+    let predecessors: Vec<_> = m
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(block, b)| successors(b.term).contains(&store_block).then_some(block))
+        .collect();
+    assert_eq!(predecessors.len(), 1);
+    let Some(Term::CondBr(first, yes, no)) = m.blocks[predecessors[0]].term else {
+        panic!("ordinary mailbox store must be guarded by the first active lane")
+    };
+    assert_eq!((yes, no), (store_block, join));
+    let V::Inst(first) = first else {
+        panic!("expected wave-first intrinsic")
+    };
+    let Op::Call(function, args) = &m.insts[first as usize].op else {
+        panic!("expected wave-first intrinsic")
+    };
+    assert_eq!(m.funcs[*function as usize].name, "dx.op.waveIsFirstLane");
+    assert_eq!(m.funcs[*function as usize].attr, Some(Attr::NoUnwind));
+    assert_eq!(args.len(), 1);
+    assert_eq!(constant(args[0]), 110);
+    let body = &m.blocks[join].body;
+    let barriers: Vec<_> = body
+        .iter()
+        .enumerate()
+        .filter_map(|(at, &id)| {
+            let Op::Call(function, args) = &m.insts[id as usize].op else {
+                return None;
+            };
+            if m.funcs[*function as usize].name != "dx.op.barrier" {
+                return None;
+            }
+            assert_eq!(constant(args[0]), 80);
+            assert_eq!(constant(args[1]), barrier_mode);
+            Some(at)
+        })
+        .collect();
+    assert_eq!(
+        barriers.len(),
+        2,
+        "both barriers must be in the unconditional join"
+    );
+    assert_eq!(
+        barriers[0], 0,
+        "the publication barrier must be the first join instruction"
+    );
+    let loads: Vec<_> = body
+        .iter()
+        .enumerate()
+        .filter_map(|(at, &id)| matches!(m.insts[id as usize].op, Op::Load(_)).then_some(at))
+        .collect();
+    assert_eq!(loads.len(), 2);
+    assert!(loads.iter().all(|&at| barriers[0] < at && at < barriers[1]));
+    let V::Inst(ptr) = ptr else {
+        panic!("expected mailbox GEP")
+    };
+    let Op::Gep(_, global, indices) = &m.insts[ptr as usize].op else {
+        panic!("expected mailbox GEP")
+    };
+    let mut memory = HashMap::new();
+    for (base, expected) in [(0, 0x0000_ffff), (32, 0xffff_0000)] {
+        let value = lane_value(m, mine, 0, base, 32);
+        assert_eq!(
+            value, expected,
+            "the two physical halves must publish distinct reductions"
+        );
+        let index = lane_value(m, *indices.last().unwrap(), 0, base, 32);
+        assert!(
+            memory.insert((*global, index), value).is_none(),
+            "the halves need distinct slots"
+        );
+        for lane in 1..32 {
+            assert_eq!(lane_value(m, mine, lane, base, 32), value);
+        }
+    }
+    for thread in 0..64 {
+        assert_eq!(
+            lane_value_with_lds(m, output, thread % 32, thread & !31, 32, &memory),
+            u32::MAX,
+            "output lane {thread} must combine both halves"
+        );
+    }
 }

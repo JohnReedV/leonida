@@ -225,6 +225,8 @@ pub(crate) struct Module {
     func_ids: HashMap<String, u32>,
     insts: Vec<Inst>,
     blocks: Vec<Block>,
+    /// Stores made conditional only after all historical block appends and phi edges settle.
+    guarded_stores: Vec<(usize, usize, V)>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
@@ -409,14 +411,53 @@ impl Module {
             self.redirect(b, 0, prologue);
         }
         for &to in successors(self.blocks[prologue].term).iter() {
-            for &id in &self.blocks[to].phis {
-                if let Op::Phi(incoming) = &mut self.insts[id as usize].op {
-                    for (_, from) in incoming {
-                        if *from == 0 {
-                            *from = prologue;
-                        }
+            self.replace_phi_predecessor(to, 0, prologue);
+        }
+    }
+
+    fn replace_phi_predecessor(&mut self, block: usize, old: usize, new: usize) {
+        for &id in &self.blocks[block].phis {
+            if let Op::Phi(incoming) = &mut self.insts[id as usize].op {
+                for (_, from) in incoming {
+                    if *from == old {
+                        *from = new;
                     }
                 }
+            }
+        }
+    }
+
+    /// Guard just this store, keeping subsequent instructions on the common path.
+    /// Callers may still append to this block, including after its terminator was set.
+    pub fn guarded_store(&mut self, block: usize, condition: V, ptr: V, value: V) {
+        self.guarded_stores
+            .push((block, self.blocks[block].body.len(), condition));
+        self.store(block, ptr, value);
+    }
+
+    /// Split after lowering has finished filling phis, before entry relocation or optimisation.
+    pub fn expand_guarded_stores(&mut self) {
+        // Later appends have larger positions within a block. Splitting them first leaves
+        // every earlier recorded position intact, including multiple exchanges in a loop.
+        for (block, position, condition) in
+            std::mem::take(&mut self.guarded_stores).into_iter().rev()
+        {
+            let write = self.new_block();
+            let join = self.new_block();
+            let suffix = self.blocks[block].body.split_off(position + 1);
+            let store = self.blocks[block]
+                .body
+                .pop()
+                .expect("guarded store position");
+            assert!(matches!(self.insts[store as usize].op, Op::Store(..)));
+            let term = self.blocks[block].term.take();
+            self.blocks[write].body.push(store);
+            self.blocks[write].term = Some(Term::Br(join));
+            self.blocks[join].body = suffix;
+            self.blocks[join].term = term;
+            self.blocks[block].term = Some(Term::CondBr(condition, write, join));
+            for &to in successors(term).iter() {
+                self.replace_phi_predecessor(to, block, join);
             }
         }
     }
@@ -716,6 +757,10 @@ impl Module {
     }
 
     pub fn write(&self) -> Vec<u8> {
+        debug_assert!(
+            self.guarded_stores.is_empty(),
+            "guarded stores must be expanded first"
+        );
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -1507,6 +1552,47 @@ mod tests {
             [entry, prologue, header, header, header, exit]
         );
         assert_eq!(result.values[&next], 3);
+    }
+
+    #[test]
+    fn guarded_stores_preserve_historical_appends_loop_phis_and_entry_relocation() {
+        let mut m = Module::default();
+        let [entry, header, exit, prologue] = [(); 4].map(|()| m.new_block());
+        let (zero, one, three, ten) = (m.i32(0), m.i32(1), m.i32(3), m.i32(10));
+        let ptr = m.global("mailbox", m.type_of(zero), 3);
+        let count = m.phi(header, m.type_of(zero));
+        let next = m.bin(header, Bin::Add, count, one);
+        let middle = m.cmp(header, pred::EQ, count, one);
+        m.guarded_store(header, middle, ptr, next);
+        let other = m.cmp(header, pred::NE, count, one);
+        let plus = m.bin(header, Bin::Add, next, ten);
+        let repeat = m.cmp(header, pred::IULT, next, three);
+        m.set_phi(count, vec![(zero, entry), (next, header)]);
+        m.terminate(entry, Term::Br(header));
+        m.terminate(header, Term::CondBr(repeat, header, exit));
+        // A historical block can still receive an exchange after its terminator is known.
+        m.guarded_store(header, other, ptr, plus);
+        let result = m.phi(exit, m.type_of(zero));
+        m.set_phi(result, vec![(plus, header)]);
+        m.terminate(exit, Term::Ret);
+        let never = m.bool(false);
+        m.guarded_store(entry, never, ptr, zero);
+        m.terminate(prologue, Term::Br(entry));
+
+        m.expand_guarded_stores();
+        m.prepend_entry(prologue);
+
+        execute::check_phis(&m);
+        let actual = execute::run(&m, 24);
+        assert_eq!(actual.stores, [(ptr, 11), (ptr, 2), (ptr, 13)]);
+        assert_eq!(actual.values[&result], 13);
+        // The ordinary cleanup must preserve the guarded effects and all repaired phi edges.
+        m.optimise(opt::ALL);
+        m.single_latches();
+        execute::check_phis(&m);
+        let optimised = execute::run(&m, 24);
+        assert_eq!(optimised.stores, actual.stores);
+        assert!(!m.write().is_empty());
     }
 
     #[test]
