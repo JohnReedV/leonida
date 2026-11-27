@@ -39,6 +39,77 @@ pub(crate) fn check_phis(m: &Module) {
     }
 }
 
+/// Check the initialization and allocation emitted for an authored split-wave program.
+pub(crate) fn check_wave_counter(m: &Module, base: V, barrier_mode: u32) {
+    let op = |v| {
+        let V::Inst(id) = v else {
+            panic!("expected instruction")
+        };
+        &m.insts[id as usize].op
+    };
+    let constant = |v| word(m, &HashMap::new(), v);
+    let call = |v, name: &str, opcode| {
+        let Op::Call(f, args) = op(v) else {
+            panic!("expected {name}")
+        };
+        assert_eq!(m.funcs[*f as usize].name, name);
+        assert_eq!(constant(args[0]), opcode);
+        &args[1..]
+    };
+    let Some(Term::CondBr(first, init, join)) = m.blocks[0].term else {
+        panic!("the reset must be guarded at entry");
+    };
+    let Op::Cmp(pred::EQ, id, zero) = op(first) else {
+        panic!("expected ID comparison")
+    };
+    assert_eq!(constant(*zero), 0);
+    assert!(call(*id, "dx.op.flattenedThreadIdInGroup.i32", 96).is_empty());
+    assert!(matches!(m.blocks[init].term, Some(Term::Br(to)) if to == join));
+    assert!(
+        matches!(m.blocks[join].term, Some(Term::Br(to)) if to != 0 && to != init && to != join)
+    );
+    let [ptr, reset] = m.blocks[init].body[..] else {
+        panic!("expected just the counter reset")
+    };
+    let Op::Store(reset_ptr, reset_value) = op(V::Inst(reset)) else {
+        panic!("expected reset store")
+    };
+    assert_eq!(*reset_ptr, V::Inst(ptr));
+    assert_eq!(constant(*reset_value), 0);
+    let Op::Gep(_, reset_lds, reset_index) = op(*reset_ptr) else {
+        panic!("expected LDS pointer")
+    };
+    let [barrier, ..] = m.blocks[join].body[..] else {
+        panic!("expected group barrier")
+    };
+    assert_eq!(
+        constant(call(V::Inst(barrier), "dx.op.barrier", 80)[0]),
+        barrier_mode
+    );
+    let ticket = call(base, "dx.op.waveReadLaneFirst.i32", 118)[0];
+    let Op::AtomicRmw(Rmw::Add, ticket_ptr, amount) = op(ticket) else {
+        panic!("expected atomic ticket")
+    };
+    let Op::Gep(_, ticket_lds, ticket_index) = op(*ticket_ptr) else {
+        panic!("expected LDS pointer")
+    };
+    assert_eq!((ticket_lds, ticket_index), (reset_lds, reset_index));
+    let V::Inst(ticket) = ticket else {
+        unreachable!()
+    };
+    assert!(
+        m.blocks[join].body[1..].contains(&ticket),
+        "the ticket must follow the barrier"
+    );
+    for lane in 0..32 {
+        assert_eq!(
+            lane_value(m, *amount, lane, 0, 32),
+            if lane == 0 { 32 } else { 0 }
+        );
+    }
+    check_phis(m);
+}
+
 /// Interpret the emitted operations, not a second implementation of the lowering rules.
 /// Unknown operations fail the test; a step budget catches missing loop guards.
 pub(crate) fn run(m: &Module, budget: usize) -> Execution {

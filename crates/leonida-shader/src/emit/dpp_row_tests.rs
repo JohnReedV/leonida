@@ -5,6 +5,13 @@ use crate::native::{ComputeIo, ResourceType, RootParam, RootType, UsedResource};
 
 const OLD: u32 = 0x1234_5678;
 
+#[test]
+fn split_wave_counter_has_one_writer_before_the_group_barrier() {
+    with_program(true, 32, 15, 15, 64, |lower, _| {
+        execute::check_wave_counter(&lower.s.m, lower.wave_base.unwrap(), meeting_mode());
+    });
+}
+
 fn with_program(
     wave64: bool,
     host_width: u32,

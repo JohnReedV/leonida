@@ -298,9 +298,11 @@ struct Lower<'a> {
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
-    /// handed to host waves (`wave_base`), and the base made in the entry block.
+    /// handed to host waves (`wave_base`), and the base made before the program body.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// Install the lazy counter prologue after the logical entry and its phi edges are emitted.
+    wave_counter_entry: Option<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1595,6 +1597,7 @@ impl<'a> Lower<'a> {
             pair: None,
             halves,
             wave_base: None,
+            wave_counter_entry: None,
             flat: None,
             no_barrier,
             fence_only,
@@ -2299,6 +2302,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if let Some(prologue) = self.wave_counter_entry {
+            self.s.m.prepend_entry(prologue);
+        }
         Ok(())
     }
 
@@ -3684,24 +3690,43 @@ impl<'a> Lower<'a> {
 
     /// A console wave64 program in host waves of 32: the first console thread of this host wave
     /// (0, 32, 64, ...). A GPU need not give a host wave consecutive thread indices (NVIDIA's
-    /// 8 x 8 groups), so each wave takes the next 32 from an LDS counter instead: every thread
-    /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
-    /// found. Branch-free, in the entry block, which every thread runs.
+    /// 8 x 8 groups), so each wave takes the next 32 from an LDS counter. After the reset,
+    /// the group meets, each wave's first lane adds 32 and the wave takes what it found.
     fn wave_base(&mut self) -> Option<V> {
         let slot = self.halves?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
-        let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let i32t = self.s.t.i32;
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
-        let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
-        if self.x.independent_waves.is_some() {
+        let e = if self.x.independent_waves.is_some() {
+            let e = self.s.entry;
+            let ptr = self.s.m.element(e, lds, k);
             self.s.m.atomic(e, Rmw::Xchg, ptr, zero);
+            e
         } else {
-            self.s.m.store(e, ptr, zero);
-        }
+            let [entry, init, join] = [(); 3].map(|()| self.s.m.new_block());
+            // An ordinary LDS store needs a single writer. The physical thread
+            // index is available before the host waves get their console thread IDs.
+            let id = self.s.op(
+                entry,
+                "flattenedThreadIdInGroup.i32",
+                Attr::ReadNone,
+                i32t,
+                96,
+                &[],
+            );
+            let first = self.s.m.cmp(entry, pred::EQ, id, zero);
+            self.s.m.terminate(entry, Term::CondBr(first, init, join));
+            let ptr = self.s.m.element(init, lds, k);
+            self.s.m.store(init, ptr, zero);
+            self.s.m.terminate(init, Term::Br(join));
+            self.s.m.terminate(join, Term::Br(self.s.entry));
+            self.wave_counter_entry = Some(entry);
+            join
+        };
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);

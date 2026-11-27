@@ -394,6 +394,33 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// Install a prologue with no predecessors after emission. Block zero remains the
+    /// function entry; the former entry keeps its instructions and outgoing edges.
+    pub fn prepend_entry(&mut self, prologue: usize) {
+        debug_assert!(self.blocks[0].phis.is_empty() && self.blocks[prologue].phis.is_empty());
+        debug_assert!(
+            !self
+                .blocks
+                .iter()
+                .any(|b| successors(b.term).contains(&prologue))
+        );
+        self.blocks.swap(0, prologue);
+        for b in 0..self.blocks.len() {
+            self.redirect(b, 0, prologue);
+        }
+        for &to in successors(self.blocks[prologue].term).iter() {
+            for &id in &self.blocks[to].phis {
+                if let Op::Phi(incoming) = &mut self.insts[id as usize].op {
+                    for (_, from) in incoming {
+                        if *from == 0 {
+                            *from = prologue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,
@@ -1455,6 +1482,31 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    #[test]
+    fn entry_prologue_preserves_loop_phi_values() {
+        let mut m = Module::default();
+        let [entry, header, exit, prologue] = [(); 4].map(|()| m.new_block());
+        let (zero, one, limit) = (m.i32(0), m.i32(1), m.i32(3));
+        let count = m.phi(header, m.type_of(zero));
+        let next = m.bin(header, Bin::Add, count, one);
+        let repeat = m.cmp(header, pred::IULT, next, limit);
+        m.set_phi(count, vec![(zero, entry), (next, header)]);
+        m.terminate(entry, Term::Br(header));
+        m.terminate(header, Term::CondBr(repeat, header, exit));
+        m.terminate(exit, Term::Ret);
+        m.terminate(prologue, Term::Br(entry));
+
+        m.prepend_entry(prologue);
+
+        execute::check_phis(&m);
+        let result = execute::run(&m, 6);
+        assert_eq!(
+            result.blocks,
+            [entry, prologue, header, header, header, exit]
+        );
+        assert_eq!(result.values[&next], 3);
     }
 
     #[test]
