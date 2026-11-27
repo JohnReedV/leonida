@@ -14,6 +14,11 @@ and its heap survive repeated submissions until that recording is reset or dropp
 Descriptor rewrites, null/fallback creation, release and reuse invalidate its class.
 The store retains the original EXEC guard and writes one raw integer component.
 
+Fixed descriptor-address selection ignores declared stride metadata: the actual static
+address, root/table offset, category and eight-word descriptor determine the binding.
+The nonzero-stride correction does not change native-view validation, invalidation or
+recording retention. Dynamically selected descriptors still retain the legacy path.
+
 The admission rules require one mip, with default SRV component mapping for loads or a
 complete UAV depth range for stores, and no 16-bit coordinates/data or dynamic descriptor
 selection. Ordinary mirrored tables, typeless resources, inferred descriptions and other
@@ -37,13 +42,14 @@ an isolated hidden display without sound or network access.
 | Literal high-bit stores, SRV-input variant | 104/104 wrong words | 0/104 wrong words |
 | Literal high-bit stores, UAV-input variant | 104/104 wrong words | 0/104 wrong words |
 
-The final program runs 32 cases: separate uploaded image loads and computed, runtime-buffer
-or literal stores, each with SRV/UAV inputs and float/integer controls. All 3,328 checked
+The corrected authored fixture, including nonzero image stride metadata, ran 32 cases:
+separate uploaded image loads and computed, runtime-buffer or literal stores, each with
+SRV/UAV inputs and float/integer controls. All 3,328 checked
 integer-path words matched. The float controls reproduced the two failures above; their
 other checked words matched. Post-fence checks exercised real native view creation,
 category mismatch, null replacement, failed creation, recreation and allocation release.
-There was no GPU fault or new validation error. The test took 1.27 seconds; that is a test
-duration, not a gameplay performance measurement.
+No GPU fault occurred; the only validation identifier was the deliberate canary. The Rust
+test reported 1.22 seconds, which is not a gameplay performance measurement.
 
 The GPU fixture uses the real descriptor creators and numeric-class query, then supplies
 the root constants directly. It does not exercise `State::bind`, asynchronous retirement
@@ -51,23 +57,29 @@ or repeated submission end to end. A separate recording-retention CPU regression
 under Windows/Proton, alongside source review. Keeping eligible tables until reset can
 increase descriptor pressure while enabled; that cost has not been measured in gameplay.
 
-Native shader tests passed (220, with two existing ignores), as did eight tests of the
-production cache codec. Windows workspace strict Clippy passed with default and all
-features, and every Windows workspace test binary compiled. Two original disabled
-programs exactly matched upstream bytecode; four enabled/disabled conversions passed
-SPIR-V validation. Thirteen exact Windows/Proton CPU tests passed without skips: three
-host contracts, eight cache tests and two original-program emission tests. The
-Linux-native workspace and GPU test commands still fail on the
-same Windows-only references as the exact upstream base; those failures were compared
-and were not changed here.
+The corrected shader source passed 221 native tests, with two existing ignores, and
+eight production cache-codec tests passed. A new regression failed before the stride
+admission correction and passed afterward; fixed descriptor addresses with zero and
+nonzero declared stride produce identical bindings and emission.
+
+Final Windows workspace checking, strict Clippy with default and all features, all
+workspace test compilation and policy checks passed. Thirteen exact Windows/Proton CPU
+tests passed without skips in 10.491 seconds: three host contracts, eight cache tests and
+two original-program emission tests. The earlier two authored disabled programs matched
+their exact base bytecode; four enabled/disabled conversions passed SPIR-V validation.
+The final corpus comparison and corrected-candidate ON/OFF playtests remain incomplete. Linux-native
+workspace/GPU tests encounter the same Windows-only reference errors as the exact base;
+compilation and focused tests are not full workspace test execution.
 
 ## Gameplay boundary
 
 This is a reproduced integer-storage correction, not an artifact-free gameplay result.
-The longer unmodified-main run still showed corrupt lighting and later hit a GPU timeout.
-The inspected lighting stores did not contain the directly failing literal pattern, and
-some use mirrored tables outside this correction's scope. No gameplay frame-rate gain or
-fix for those visible blocks is claimed. R-9 and the other rendering TODO rows remain open.
+An earlier branch OFF short run completed with rectangular courtyard lighting artifacts
+still visible; it did not exercise integer class selection. A longer unmodified-main run
+also showed corrupt lighting and later hit a GPU timeout. Dynamically selected descriptors
+and mirrored tables remain outside this correction's scope. No gameplay frame-rate gain
+or fix for those visible blocks is claimed. R-9 and the other rendering TODO rows remain
+open.
 
 No existing TODO row is closed by this narrowly scoped fix. All programs and values in
 the committed regression tests are original; game-derived captures and shader output
