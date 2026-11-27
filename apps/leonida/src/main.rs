@@ -11,10 +11,11 @@ mod run;
 mod shader;
 mod translate;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 /// The build number the Release workflow sets (`git rev-list --count` of
 /// the commit), or `local` for a build made anywhere else.
@@ -33,8 +34,8 @@ const COMMIT: &str = match option_env!("RELEASE_BUILD_COMMIT") {
 #[command(
     name = "leonida",
     version,
-    about = "Run an Xbox Series title natively on Windows. Without a command (as when \
-             leonida.exe is double-clicked), it asks what it needs and starts the game."
+    about = "Run an Xbox Series title natively on Windows. Without a command, in a console \
+             (as when leonida.exe is double-clicked), it asks what it needs and starts the game."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -167,7 +168,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let Some(command) = Cli::parse().command else {
-        play::run();
+        if std::io::stdin().is_terminal() {
+            play::run();
+        }
+        // A script or a launcher has nobody to answer the questions or watch
+        // the game: print the usage instead.
+        let _ = Cli::command().print_help();
+        std::process::exit(2);
     };
     match command {
         Command::Version => {

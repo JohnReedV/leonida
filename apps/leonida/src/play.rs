@@ -13,6 +13,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use anyhow::{Context, Result};
+use windows_sys::Win32::Foundation::{FALSE, TRUE};
+use windows_sys::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE,
+    SetConsoleCtrlHandler,
+};
+use windows_sys::core::BOOL;
+
+/// How a process that Ctrl+C or Ctrl+Break ended exits (STATUS_CONTROL_C_EXIT).
+const CTRL_C_EXIT: u32 = 0xC000_013A;
 
 const WARM_UP_QUESTION: &str = "\
 Warm up the shader cache first? It translates every shader before the game starts:
@@ -24,11 +33,17 @@ slower until the cache fills up.";
 /// it could not be started).
 pub fn run() -> ! {
     println!("{}", title(crate::BUILD));
+    use_exe_folder();
     let code = match play() {
         Ok(status) if status.success() => {
             println!();
             println!("The game has closed.");
             0
+        }
+        Ok(status) if stopped_by_ctrl_c(status) => {
+            println!();
+            println!("The game was stopped with Ctrl+C.");
+            status.code().unwrap_or(1)
         }
         Ok(status) => {
             println!();
@@ -61,9 +76,14 @@ fn play() -> Result<ExitStatus> {
     // them, mid-play.
     println!();
     println!("{WARM_UP_QUESTION}");
-    if ask_yes("Warm up now?") {
+    let warm_up = ask_yes("Warm up now?");
+    outlive_ctrl_c();
+    if warm_up {
         match leonida(&["translate", "--warm", "all"], &dir, false) {
             Ok(status) if status.success() => {}
+            Ok(status) if stopped_by_ctrl_c(status) => {
+                println!("WARNING: the warm-up was stopped with Ctrl+C; starting anyway")
+            }
             Ok(status) => {
                 println!(
                     "WARNING: the warm-up failed ({}); starting anyway",
@@ -96,7 +116,7 @@ fn game_dir() -> Result<PathBuf> {
             return Ok(dir.clone());
         }
         println!(
-            "The saved game folder has no MicrosoftGame.config: {}",
+            "The game folder has no MicrosoftGame.config: {}",
             dir.display()
         );
     }
@@ -160,12 +180,95 @@ fn wait_for_enter() {
     println!();
     print!("Press Enter to close this window.");
     let _ = std::io::stdout().flush();
+    // Nobody reads the console while the warm-up or the game runs: an Enter
+    // pressed then would close the window before this can be read.
+    // SAFETY: GetStdHandle takes no pointers, and FlushConsoleInputBuffer
+    // only fails if the handle is not a console.
+    unsafe { FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE)) };
     let _ = std::io::stdin().lock().read_line(&mut String::new());
+}
+
+/// Moves to leonida.exe's folder when there is no config file to use, so a
+/// start from elsewhere (the Run dialog, a launcher) finds and saves
+/// leonida.toml next to the exe, as a double-click in File Explorer does.
+fn use_exe_folder() {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    if is_temporary(&dir) {
+        println!(
+            "WARNING: leonida.exe runs from a temporary folder, which Windows empties: {}",
+            dir.display()
+        );
+        println!("Unpack the zip to a folder of its own first, or your settings are lost.");
+    }
+    if std::env::var_os("LEONIDA_CONFIG").is_some() || Path::new("leonida.toml").is_file() {
+        return;
+    }
+    if let Err(e) = std::env::set_current_dir(&dir) {
+        println!("WARNING: could not move to {} ({e})", dir.display());
+    }
+}
+
+/// Whether `dir` is under %TEMP%, where File Explorer puts an exe opened
+/// from inside a zip. Canonical paths, since %TEMP% may use short names.
+fn is_temporary(dir: &Path) -> bool {
+    match (
+        std::fs::canonicalize(dir),
+        std::fs::canonicalize(std::env::temp_dir()),
+    ) {
+        (Ok(dir), Ok(temp)) => dir.starts_with(temp),
+        _ => false,
+    }
+}
+
+/// From here on Ctrl+C and Ctrl+Break end only the warm-up or the game, which
+/// keep the default handler, and this process stays to say how they ended.
+/// Not `SetConsoleCtrlHandler(None, TRUE)`: children inherit that and would
+/// ignore Ctrl+C too.
+fn outlive_ctrl_c() {
+    // SAFETY: the handler is a plain function that lives as long as the
+    // process and touches no state.
+    unsafe { SetConsoleCtrlHandler(Some(ignore_ctrl_c), TRUE) };
+}
+
+unsafe extern "system" fn ignore_ctrl_c(event: u32) -> BOOL {
+    if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+fn stopped_by_ctrl_c(status: ExitStatus) -> bool {
+    status.code().is_some_and(|code| code as u32 == CTRL_C_EXIT)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_yes, title};
+    use std::os::windows::process::ExitStatusExt;
+    use std::path::Path;
+    use std::process::ExitStatus;
+
+    use super::{is_temporary, is_yes, stopped_by_ctrl_c, title};
+
+    #[test]
+    fn ctrl_c_is_its_exit_code() {
+        assert!(stopped_by_ctrl_c(ExitStatus::from_raw(0xC000_013A)));
+        for code in [0, 1, 0xC000_0005] {
+            assert!(!stopped_by_ctrl_c(ExitStatus::from_raw(code)), "{code:#x}");
+        }
+    }
+
+    #[test]
+    fn the_temp_folder_is_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_temporary(dir.path()));
+        assert!(!is_temporary(Path::new(env!("CARGO_MANIFEST_DIR"))));
+    }
 
     #[test]
     fn enter_and_yes_mean_yes() {
