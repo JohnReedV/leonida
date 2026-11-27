@@ -17,6 +17,19 @@ picture and frame times. Synthetic tests cover private writes, two views
 of one section, a write through the other view, and untracked memory.
 No gameplay improvement is claimed yet.
 
+An exploratory offline Proton 11 A/B on an RTX 5090 and i9-14900KS
+alternated the path every twenty seconds in the opening 3D scene, with
+the separate Linux launcher, pipeline-library, shader-control-flow and
+texture-range-lock fixes also present. After the shader-validation jobs
+ended, six world frame summaries per mode (at least 1,000 draws) had
+median frame times of 2,846 ms with the old path and 2,777 ms with the
+single asking: both were about 0.3 fps. Texture-refresh summaries showed
+median time asking write watch and guards of 726 ms across 11 old-path
+samples and 46 ms across 15 single-asking samples; failed kernel asks
+fell from a median of 851 to 172 per frame across six and seven samples.
+These are small, changing-scene samples, and the run still ended at the
+title's existing watchdog. They establish less query work, not an FPS gain.
+
 **R-7: a lane mask copied back one half at a time.**
 `CS_TransmissionVolumetrics`, `CS_TransmissionVolumetricsSubmerged` and
 `PS_VoxelizeVisiblity` park a 64-bit lane mask in VGPR lanes and read it
