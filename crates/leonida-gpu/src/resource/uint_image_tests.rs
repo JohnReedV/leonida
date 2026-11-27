@@ -118,7 +118,9 @@ fn native_program_for(input_kind: ResourceType, store: Store) -> NativeProgram {
             root: RootType::Table,
             table_offset_dwords,
             lower_bound: 0,
-            stride: 0,
+            // Image selection comes from the fixed descriptor address, not this
+            // buffer-oriented metadata field. Exercise a nonzero value too.
+            stride: if dwords == 8 { 4 } else { 0 },
             dwords,
             user_data: 0,
             slot: 0,
