@@ -1,0 +1,109 @@
+name: Release
+
+# A ready-made leonida.exe for players without Rust or git: every push to main whose CI passed
+# is published as a release "Build <n>" (tag build-<n>) with leonida-windows-x64.zip. <n> is the
+# number of commits up to that one (git rev-list --count), so a checkout can work out the same
+# number for itself, and the launcher compares it with the newest release to offer an update.
+# A pull request that changes this file builds the zip as an artifact and publishes nothing.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SHA }}
+          fetch-depth: 0
+      - name: Build number
+        shell: pwsh
+        run: |
+          $n = git rev-list --count $env:SHA
+          if ($LASTEXITCODE -ne 0) { throw 'git rev-list failed' }
+          "RELEASE_BUILD_NUMBER=$n" >> $env:GITHUB_ENV
+          "RELEASE_BUILD_COMMIT=$env:SHA" >> $env:GITHUB_ENV
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # RELEASE_BUILD_NUMBER and RELEASE_BUILD_COMMIT are read at compile time by
+      # `leonida version`.
+      - name: Build
+        run: cargo build --release --locked -p leonida
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = New-Item -ItemType Directory leonida
+          Copy-Item target\release\leonida.exe, LICENSE $dir
+          $source = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/tree/$env:SHA"
+          @(
+            "build=$env:RELEASE_BUILD_NUMBER",
+            "commit=$env:SHA",
+            "source=$source"
+          ) | Set-Content -Encoding utf8 (Join-Path $dir 'version.txt')
+          @(
+            "Leonida Legacy, build $env:RELEASE_BUILD_NUMBER",
+            '',
+            'Double-click leonida.exe. The first time it asks for the folder of your copy of the',
+            'game, then offers to warm up the shader cache and starts the game.',
+            'Your settings stay in leonida.toml in this folder: copy it into the folder of a newer',
+            'build to keep them.',
+            '',
+            "Source code of this build: $source"
+          ) | Set-Content -Encoding utf8 (Join-Path $dir 'README.txt')
+          Compress-Archive -Path $dir -DestinationPath leonida-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leonida-windows-x64
+          path: leonida-windows-x64.zip
+          retention-days: 7
+      - name: Publish
+        if: >-
+          github.event_name == 'workflow_run' ||
+          (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "build-$env:RELEASE_BUILD_NUMBER"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { "$tag is published already"; exit 0 }
+          $short = $env:SHA.Substring(0, 8)
+          $notes = @(
+            "Built from $short on main by the Release workflow.",
+            '',
+            '1. Download leonida-windows-x64.zip below and unpack it.',
+            '2. Double-click leonida.exe in the leonida folder.',
+            '',
+            'Windows 10/11 x64, a CPU with AVX2 and a Direct3D 12 card with shader model 6.6 and',
+            'mesh shaders. You need your own copy of the game. Windows may warn that the file is',
+            'not signed: More info, then Run anyway.'
+          ) -join "`n"
+          gh release create $tag leonida-windows-x64.zip --target $env:SHA `
+            --title "Build $env:RELEASE_BUILD_NUMBER ($short)" --notes $notes --latest
