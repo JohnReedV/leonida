@@ -78,19 +78,32 @@ The prior revision passed thirteen Windows/Proton host, cache and authored-emiss
 tests; those are not repeated-test claims for the final executable. Its unchanged host
 contracts and cache handling also received independent source review. The earlier two
 authored disabled programs matched the base bytecode; four enabled/disabled conversions
-passed SPIR-V validation. Final corpus and ON/OFF playtests remain incomplete. Linux-native
-workspace/GPU tests encounter the same Windows-only reference errors as the exact base;
-compilation and focused tests are not full workspace test execution.
+passed SPIR-V validation. The final disabled corpus completed in both cache scopes:
+all 25,754 emitted blobs were byte-identical to the baseline, and all 25,953 explicit
+outcomes matched. The enabled corpus was stopped at the user's request after processing
+more than 23,000 containers in its first scope; its final result and second scope are
+unverified. Recovery of every rejection found in the preceding revision is not claimed.
+Linux-native workspace/GPU tests encounter the same Windows-only reference errors as the
+exact base; compilation and focused tests are not full workspace test execution.
 
 ## Gameplay boundary
 
 This is a reproduced integer-storage correction, not an artifact-free gameplay result.
-An earlier branch OFF short run completed with rectangular courtyard lighting artifacts
-still visible; it did not exercise integer class selection. A longer unmodified-main run
-also showed corrupt lighting and later hit a GPU timeout. Dynamically selected descriptors
-and mirrored tables remain outside this correction's scope. No gameplay frame-rate gain
-or fix for those visible blocks is claimed. R-9 and the other rendering TODO rows remain
-open.
+The final enabled run reached the opening courtyard and stopped after the completed
+world+16 image, about nine minutes including loading. Host binding diagnostics recorded
+at least 8,192 integer-class selections and 4,096 legacy selections; these are host
+decisions before root constants, not proof of GPU pixel ownership. The final image
+remained washed out and blurred. The preceding revision's disabled short run also showed
+corrupt lighting. These are not same-binary ON/OFF gameplay measurements or a warm-cache
+performance comparison.
+
+Both short runs completed without a GPU fault and their test resources were retired.
+Pre-existing game validation findings remained. A longer unmodified-main run previously
+hit a GPU timeout, so the repository's full world-600/world-1000 protocol and long-session
+stability remain unverified. The user requested all further tests stop. Dynamically
+selected descriptors and mirrored tables remain outside this correction's scope.
+No gameplay frame-rate gain or fix for the visible artifacts is claimed. R-9 and the
+other rendering TODO rows remain open.
 
 No existing TODO row is closed by this narrowly scoped fix. All programs and values in
 the committed regression tests are original; game-derived captures and shader output
