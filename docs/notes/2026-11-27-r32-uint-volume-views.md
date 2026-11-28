@@ -12,7 +12,8 @@ integer paths. The host selects integer access only from the final explicit nati
 `R32_UINT` view in a private descriptor allocation owned by the recording. The allocation
 and its heap survive repeated submissions until that recording is reset or dropped.
 Descriptor rewrites, null/fallback creation, release and reuse invalidate its class.
-The store retains the original EXEC guard and writes one raw integer component.
+The store retains the original EXEC guard. It supplies four defined raw operands with
+DXIL's full typed-store mask; the admitted scalar `R32_UINT` view consumes X.
 
 Fixed descriptor-address selection ignores declared stride metadata: the actual static
 address, root/table offset, category and eight-word descriptor determine the binding.
@@ -42,14 +43,15 @@ an isolated hidden display without sound or network access.
 | Literal high-bit stores, SRV-input variant | 104/104 wrong words | 0/104 wrong words |
 | Literal high-bit stores, UAV-input variant | 104/104 wrong words | 0/104 wrong words |
 
-The corrected authored fixture, including nonzero image stride metadata, ran 32 cases:
+The final fixture first validated all 16 authored shader variants with the Windows SDK,
+before creating a device. With nonzero image stride metadata, it then ran 32 cases:
 separate uploaded image loads and computed, runtime-buffer or literal stores, each with
 SRV/UAV inputs and float/integer controls. All 3,328 checked
 integer-path words matched. The float controls reproduced the two failures above; their
 other checked words matched. Post-fence checks exercised real native view creation,
 category mismatch, null replacement, failed creation, recreation and allocation release.
 No GPU fault occurred; the only validation identifier was the deliberate canary. The Rust
-test reported 1.22 seconds, which is not a gameplay performance measurement.
+test reported 4.09 seconds, which is not a gameplay performance measurement.
 
 The GPU fixture uses the real descriptor creators and numeric-class query, then supplies
 the root constants directly. It does not exercise `State::bind`, asynchronous retirement
@@ -60,14 +62,23 @@ increase descriptor pressure while enabled; that cost has not been measured in g
 The corrected shader source passed 221 native tests, with two existing ignores, and
 eight production cache-codec tests passed. A new regression failed before the stride
 admission correction and passed afterward; fixed descriptor addresses with zero and
-nonzero declared stride produce identical bindings and emission.
+nonzero declared stride produce identical bindings and emission. The typed-store mask
+regression also failed before the correction and passed afterward.
 
-Final Windows workspace checking, strict Clippy with default and all features, all
-workspace test compilation and policy checks passed. Thirteen exact Windows/Proton CPU
-tests passed without skips in 10.491 seconds: three host contracts, eight cache tests and
-two original-program emission tests. The earlier two authored disabled programs matched
-their exact base bytecode; four enabled/disabled conversions passed SPIR-V validation.
-The final corpus comparison and corrected-candidate ON/OFF playtests remain incomplete. Linux-native
+Windows workspace checking, strict Clippy with default and all features, and all
+workspace test compilation passed using `cargo xwin` on Linux, with
+`blake3/prefer_intrinsics` for the cross-build. Asset policy passed for 306 files.
+Two exact SDK-only Windows/Proton tests passed without skips in 1.841 seconds, with
+devices, display, audio and network disabled: all 16 variants validate, and the SDK
+rejects an authored incomplete-mask negative control with the expected diagnostic.
+The explicit `LEONIDA_DXIL_VALIDATOR` path was pinned and its native load verified.
+The hardware test now requires SDK validation rather than relying on driver acceptance.
+
+The prior revision passed thirteen Windows/Proton host, cache and authored-emission
+tests; those are not repeated-test claims for the final executable. Its unchanged host
+contracts and cache handling also received independent source review. The earlier two
+authored disabled programs matched the base bytecode; four enabled/disabled conversions
+passed SPIR-V validation. Final corpus and ON/OFF playtests remain incomplete. Linux-native
 workspace/GPU tests encounter the same Windows-only reference errors as the exact base;
 compilation and focused tests are not full workspace test execution.
 
